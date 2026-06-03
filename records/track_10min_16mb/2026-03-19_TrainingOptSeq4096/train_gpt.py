@@ -1254,6 +1254,8 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        train_token_count = torch.zeros((), device=device, dtype=torch.float64)
+        train_byte_count = torch.zeros((), device=device, dtype=torch.float64)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1262,7 +1264,20 @@ def main() -> None:
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            prev_ids = x.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            train_token_count += float(tgt_ids.numel())
+            train_byte_count += token_bytes.to(torch.float64).sum()
         train_loss /= grad_accum_steps
+        if distributed:
+            dist.all_reduce(train_token_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(train_byte_count, op=dist.ReduceOp.SUM)
+
+        train_bits_per_token = float(train_loss.item()) / math.log(2.0)
+        train_tokens_per_byte = float(train_token_count.item()) / max(float(train_byte_count.item()), 1.0)
+        train_bpb = train_bits_per_token * train_tokens_per_byte
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1294,7 +1309,17 @@ def main() -> None:
                 "progress/remaining_steps": max(args.iterations - step, 0),
                 "train/loss": float(train_loss.item()),
                 "train/perplexity": math.exp(min(float(train_loss.item()), 20.0)),
+                "train/bpb": train_bpb,
+                "train_bpb": train_bpb,
+                "train/bits_per_token": train_bits_per_token,
+                "train/tokens_per_byte": train_tokens_per_byte,
+                "train/bytes_per_token": 1.0 / max(train_tokens_per_byte, 1.0e-12),
+                "train/batch_tokens": float(train_token_count.item()),
+                "train/batch_bytes": float(train_byte_count.item()),
                 "fineweb/train_loss": float(train_loss.item()),
+                "fineweb/train_bpb": train_bpb,
+                "bpb/train": train_bpb,
+                "openai_parameter_golf/train_bpb": train_bpb,
                 "fineweb/train_time_ms": approx_training_time_ms,
                 "time/train_ms": approx_training_time_ms,
                 "time/train_seconds": approx_training_time_ms / 1000.0,
@@ -1323,7 +1348,8 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
+                f"train_bpb:{train_bpb:.4f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
