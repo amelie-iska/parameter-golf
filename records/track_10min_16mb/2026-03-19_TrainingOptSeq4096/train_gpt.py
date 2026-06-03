@@ -110,6 +110,10 @@ class Hyperparameters:
     bigram_bias_lr = float(os.environ.get("BIGRAM_BIAS_LR", 0.05))
     bigram_bias_init_std = float(os.environ.get("BIGRAM_BIAS_INIT_STD", 0.0))
     bigram_bias_scale = float(os.environ.get("BIGRAM_BIAS_SCALE", 1.0))
+    bigram_bias_init_from_data = os.environ.get("BIGRAM_BIAS_INIT_FROM_DATA", "0").lower() in {"1", "true", "yes", "on"}
+    bigram_bias_init_tokens = int(os.environ.get("BIGRAM_BIAS_INIT_TOKENS", 100_000_000))
+    bigram_bias_init_alpha = float(os.environ.get("BIGRAM_BIAS_INIT_ALPHA", 0.1))
+    bigram_bias_init_strength = float(os.environ.get("BIGRAM_BIAS_INIT_STRENGTH", 0.35))
 
 
 SECRET_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
@@ -506,6 +510,90 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+
+
+def load_data_shard_prefix(file: Path, max_tokens: int) -> Tensor:
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    token_bytes = np.dtype("<u2").itemsize
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    num_tokens = int(header[2])
+    expected_size = header_bytes + num_tokens * token_bytes
+    if file.stat().st_size != expected_size:
+        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+    count = max(0, min(int(max_tokens), num_tokens))
+    tokens_np = np.fromfile(file, dtype="<u2", count=count, offset=header_bytes)
+    if tokens_np.size != count:
+        raise ValueError(f"Short read for {file}")
+    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+
+
+def build_bigram_logit_bias_from_tokens(
+    tokens: Tensor,
+    vocab_size: int,
+    alpha: float,
+    strength: float,
+) -> Tensor:
+    if tokens.numel() < 2:
+        return torch.zeros((vocab_size, vocab_size), dtype=torch.float32)
+    ids = tokens.to(dtype=torch.int64).reshape(-1)
+    prev = ids[:-1]
+    nxt = ids[1:]
+    valid = (prev >= 0) & (prev < vocab_size) & (nxt >= 0) & (nxt < vocab_size)
+    if not bool(valid.any()):
+        return torch.zeros((vocab_size, vocab_size), dtype=torch.float32)
+    flat = prev[valid] * vocab_size + nxt[valid]
+    counts = torch.bincount(flat, minlength=vocab_size * vocab_size).reshape(vocab_size, vocab_size).to(torch.float32)
+    counts.add_(float(alpha))
+    log_probs = counts.log() - counts.sum(dim=1, keepdim=True).log()
+    return log_probs.mul(float(strength)).to(dtype=torch.float32)
+
+
+def build_bigram_logit_bias_from_shards(
+    pattern: str,
+    vocab_size: int,
+    max_tokens: int,
+    alpha: float,
+    strength: float,
+    log0,
+) -> Tensor:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    remaining: int | None = None if int(max_tokens) <= 0 else int(max_tokens)
+    counts = torch.full((vocab_size, vocab_size), float(alpha), dtype=torch.float32)
+    total_tokens = 0
+    previous_tail: Tensor | None = None
+    for file in files:
+        if remaining == 0:
+            break
+        take = remaining if remaining is not None else 2**63 - 1
+        tokens = load_data_shard_prefix(file, take)
+        if tokens.numel() == 0:
+            continue
+        read_count = int(tokens.numel())
+        if previous_tail is not None:
+            tokens = torch.cat((previous_tail, tokens))
+        ids = tokens.to(dtype=torch.int64).reshape(-1)
+        prev = ids[:-1]
+        nxt = ids[1:]
+        valid = (prev >= 0) & (prev < vocab_size) & (nxt >= 0) & (nxt < vocab_size)
+        if bool(valid.any()):
+            flat = prev[valid] * vocab_size + nxt[valid]
+            counts.add_(torch.bincount(flat, minlength=vocab_size * vocab_size).reshape(vocab_size, vocab_size).to(torch.float32))
+        previous_tail = ids[-1:].to(dtype=torch.uint16)
+        total_tokens += read_count
+        if remaining is not None:
+            remaining = max(0, remaining - read_count)
+    log_probs = counts.log() - counts.sum(dim=1, keepdim=True).log()
+    bias = log_probs.mul(float(strength)).to(dtype=torch.float32)
+    log0(
+        "bigram_bias_init_from_data:"
+        f"tokens:{total_tokens} files:{len(files)} alpha:{alpha} strength:{strength} "
+        f"bias_min:{float(bias.min()):.4f} bias_max:{float(bias.max()):.4f}"
+    )
+    return bias
 
 
 class TokenStream:
@@ -938,7 +1026,22 @@ def main() -> None:
         bigram_bias=args.bigram_bias,
         bigram_bias_init_std=args.bigram_bias_init_std,
         bigram_bias_scale=args.bigram_bias_scale,
-    ).to(device).bfloat16()
+    )
+    if args.bigram_bias and args.bigram_bias_init_from_data:
+        if base_model.prev_token_bias is None:
+            raise RuntimeError("BIGRAM_BIAS_INIT_FROM_DATA requires BIGRAM_BIAS=1")
+        with torch.no_grad():
+            base_model.prev_token_bias.weight.copy_(
+                build_bigram_logit_bias_from_shards(
+                    args.train_files,
+                    args.vocab_size,
+                    args.bigram_bias_init_tokens,
+                    args.bigram_bias_init_alpha,
+                    args.bigram_bias_init_strength,
+                    log0,
+                )
+            )
+    base_model = base_model.to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
