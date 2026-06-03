@@ -54,6 +54,12 @@ class Hyperparameters:
     checkpoint_every = int(os.environ.get("CHECKPOINT_EVERY", 0))
     checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "checkpoints/training_opt_seq4096")
     resume_checkpoint = os.environ.get("RESUME_CHECKPOINT", "")
+    reset_optimizer_on_resume = os.environ.get(
+        "RESET_OPTIMIZER_ON_RESUME",
+        os.environ.get("RESET_OPTIMIZER", "0"),
+    ).lower() in {"1", "true", "yes", "on"}
+    reset_rng_on_resume = os.environ.get("RESET_RNG_ON_RESUME", "0").lower() in {"1", "true", "yes", "on"}
+    reset_loader_on_resume = os.environ.get("RESET_LOADER_ON_RESUME", "0").lower() in {"1", "true", "yes", "on"}
     wandb_enabled = os.environ.get("WANDB", "1").lower() not in {"0", "false", "no", "off", "disabled"}
     wandb_project = os.environ.get("WANDB_PROJECT", "toricgt-parameter-golf")
     wandb_entity = os.environ.get("WANDB_ENTITY", "amelie-iska-math")
@@ -986,6 +992,12 @@ def main() -> None:
         log0(f"checkpointing:every:{args.checkpoint_every} dir:{args.checkpoint_dir}")
     if args.resume_checkpoint:
         log0(f"resume_checkpoint:{args.resume_checkpoint}")
+        log0(
+            "resume_controls:"
+            f"reset_optimizer:{int(args.reset_optimizer_on_resume)} "
+            f"reset_rng:{int(args.reset_rng_on_resume)} "
+            f"reset_loader:{int(args.reset_loader_on_resume)}"
+        )
     log0(f"seed:{args.seed}")
 
     wandb_run = None
@@ -1153,17 +1165,25 @@ def main() -> None:
         checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
         base_model.load_state_dict(checkpoint["model"], strict=True)
         optimizer_states = checkpoint["optimizers"]
-        for opt, state in zip(optimizers, optimizer_states, strict=True):
-            opt.load_state_dict(state)
-        train_loader.load_state_dict(checkpoint["loader"])
+        if args.reset_optimizer_on_resume:
+            log0("resume_optimizer_reset:1")
+        else:
+            for opt, state in zip(optimizers, optimizer_states, strict=True):
+                opt.load_state_dict(state)
+        if args.reset_loader_on_resume:
+            log0("resume_loader_reset:1")
+        else:
+            train_loader.load_state_dict(checkpoint["loader"])
         training_time_ms = float(checkpoint.get("training_time_ms", 0.0))
         step = int(checkpoint["step"])
         best_val_bpb = float(checkpoint.get("best_val_bpb", math.inf))
         checkpoint_initial_val_bpb = checkpoint.get("initial_val_bpb")
         initial_val_bpb = None if checkpoint_initial_val_bpb is None else float(checkpoint_initial_val_bpb)
-        if "rng_cpu" in checkpoint:
+        if args.reset_rng_on_resume:
+            log0("resume_rng_reset:1")
+        elif "rng_cpu" in checkpoint:
             torch.set_rng_state(checkpoint["rng_cpu"])
-        if "rng_cuda" in checkpoint:
+        if not args.reset_rng_on_resume and "rng_cuda" in checkpoint:
             torch.cuda.set_rng_state_all(checkpoint["rng_cuda"])
         log0(f"checkpoint_resumed:{args.resume_checkpoint} step:{step} train_time:{training_time_ms:.0f}ms")
     stop_after_step: int | None = None
