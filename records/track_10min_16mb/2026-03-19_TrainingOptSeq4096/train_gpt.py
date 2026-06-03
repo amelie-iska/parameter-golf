@@ -50,6 +50,9 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    checkpoint_every = int(os.environ.get("CHECKPOINT_EVERY", 0))
+    checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "checkpoints/training_opt_seq4096")
+    resume_checkpoint = os.environ.get("RESUME_CHECKPOINT", "")
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -248,7 +251,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
@@ -460,6 +463,14 @@ class TokenStream:
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
+    def state_dict(self) -> dict[str, int]:
+        return {"file_idx": self.file_idx, "pos": self.pos}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.file_idx = int(state["file_idx"]) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = int(state["pos"])
+
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
         remaining = n
@@ -493,6 +504,15 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+    def state_dict(self) -> dict[str, object]:
+        return {"stream": self.stream.state_dict()}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        stream_state = state.get("stream")
+        if not isinstance(stream_state, dict):
+            raise ValueError("Loader checkpoint is missing stream state")
+        self.stream.load_state_dict(stream_state)
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -544,7 +564,10 @@ class Rotary(nn.Module):
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        # Initial validation runs under torch.inference_mode().  In PyTorch
+        # 2.8, tensors created there cannot later be saved for backward, so
+        # return normal tensors even when the cache was populated during eval.
+        return self._cos_cached.to(dtype=dtype).clone(), self._sin_cached.to(dtype=dtype).clone()
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -908,6 +931,10 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.checkpoint_every > 0:
+        log0(f"checkpointing:every:{args.checkpoint_every} dir:{args.checkpoint_dir}")
+    if args.resume_checkpoint:
+        log0(f"resume_checkpoint:{args.resume_checkpoint}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -961,16 +988,62 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    def save_training_checkpoint(step: int, training_time_ms: float) -> None:
+        if not master_process or args.checkpoint_every <= 0:
+            return
+        checkpoint_dir = Path(args.checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = checkpoint_dir / f"{args.run_id}_step_{step:06d}.pt"
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        payload = {
+            "step": step,
+            "training_time_ms": training_time_ms,
+            "model": base_model.state_dict(),
+            "optimizers": [opt.state_dict() for opt in optimizers],
+            "loader": train_loader.state_dict(),
+            "rng_cpu": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state_all(),
+        }
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+        latest = checkpoint_dir / f"{args.run_id}_latest.pt"
+        latest_tmp = latest.with_suffix(latest.suffix + ".tmp")
+        if latest_tmp.exists():
+            latest_tmp.unlink()
+        try:
+            os.link(path, latest_tmp)
+            os.replace(latest_tmp, latest)
+        except OSError:
+            torch.save(payload, latest_tmp)
+            os.replace(latest_tmp, latest)
+        log0(f"checkpoint_saved:{path} bytes:{path.stat().st_size}")
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
 
     training_time_ms = 0.0
+    step = 0
+    if args.resume_checkpoint:
+        if world_size != 1:
+            raise ValueError("RESUME_CHECKPOINT currently supports WORLD_SIZE=1")
+        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
+        base_model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer_states = checkpoint["optimizers"]
+        for opt, state in zip(optimizers, optimizer_states, strict=True):
+            opt.load_state_dict(state)
+        train_loader.load_state_dict(checkpoint["loader"])
+        training_time_ms = float(checkpoint.get("training_time_ms", 0.0))
+        step = int(checkpoint["step"])
+        if "rng_cpu" in checkpoint:
+            torch.set_rng_state(checkpoint["rng_cpu"])
+        if "rng_cuda" in checkpoint:
+            torch.cuda.set_rng_state_all(checkpoint["rng_cuda"])
+        log0(f"checkpoint_resumed:{args.resume_checkpoint} step:{step} train_time:{training_time_ms:.0f}ms")
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -994,6 +1067,11 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            checkpoint_due = args.checkpoint_every > 0 and step > 0 and (last_step or step % args.checkpoint_every == 0)
+            if checkpoint_due:
+                save_training_checkpoint(step, training_time_ms)
+                if distributed:
+                    dist.barrier()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
