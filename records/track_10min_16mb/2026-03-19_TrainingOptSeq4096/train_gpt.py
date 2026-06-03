@@ -995,7 +995,8 @@ def main() -> None:
         if wandb_run is None:
             return
         try:
-            wandb_run.log(metrics, step=step_for_wandb)
+            metrics.setdefault("trainer/step", step_for_wandb)
+            wandb_run.log(metrics)
         except Exception as exc:
             log0(f"wandb:log_disabled_after_error:{type(exc).__name__}")
             wandb_run = None
