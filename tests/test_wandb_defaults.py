@@ -22,6 +22,10 @@ class WandbDefaultsTest(unittest.TestCase):
         self.assertIn('Path("keys.txt")', source)
         self.assertIn("wandb.init", source)
         self.assertIn("wandb_run.log", source)
+        self.assertIn('"val/bpb": val_bpb', source)
+        self.assertIn('"val_bpb": val_bpb', source)
+        self.assertIn('"bpb": val_bpb', source)
+        self.assertIn('"openai_parameter_golf/bpb": val_bpb', source)
 
 
 if __name__ == "__main__":

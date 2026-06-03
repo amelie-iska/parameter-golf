@@ -1176,6 +1176,9 @@ def main() -> None:
                 {
                     "val/loss": val_loss,
                     "val/bpb": val_bpb,
+                    "val_bpb": val_bpb,
+                    "bpb": val_bpb,
+                    "openai_parameter_golf/bpb": val_bpb,
                     "time/train_ms": training_time_ms,
                     "time/step_avg_ms": training_time_ms / max(step, 1),
                 },
