@@ -21,11 +21,19 @@ class WandbDefaultsTest(unittest.TestCase):
         self.assertIn("find_wandb_api_key", source)
         self.assertIn('Path("keys.txt")', source)
         self.assertIn("wandb.init", source)
+        self.assertIn("wandb.define_metric", source)
         self.assertIn("wandb_run.log", source)
         self.assertIn('"val/bpb": val_bpb', source)
         self.assertIn('"val_bpb": val_bpb', source)
         self.assertIn('"bpb": val_bpb', source)
         self.assertIn('"openai_parameter_golf/bpb": val_bpb', source)
+        self.assertIn('"fineweb/val_bpb": val_bpb', source)
+        self.assertIn('"fineweb/best_val_bpb": best_val_bpb', source)
+        self.assertIn('"bpb/gap_to_target": target_gap', source)
+        self.assertIn('"progress/fraction": step / max(args.iterations, 1)', source)
+        self.assertIn('"perf/train_tokens_per_second": tokens_per_second', source)
+        self.assertIn('"system/vram_allocated_gb": torch.cuda.memory_allocated(device) / 1e9', source)
+        self.assertIn('"checkpoint/bytes": checkpoint_bytes', source)
 
 
 if __name__ == "__main__":

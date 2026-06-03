@@ -63,6 +63,7 @@ class Hyperparameters:
     wandb_mode = os.environ.get("WANDB_MODE", "online")
     wandb_key_path = os.environ.get("WANDB_KEY_PATH", "")
     wandb_log_every = int(os.environ.get("WANDB_LOG_EVERY", 1))
+    target_bpb = float(os.environ.get("TARGET_BPB", 1.2))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -1035,6 +1036,8 @@ def main() -> None:
                     mode=args.wandb_mode,
                     config=wandb_config,
                 )
+                wandb.define_metric("trainer/step")
+                wandb.define_metric("*", step_metric="trainer/step")
                 log0(
                     f"wandb:enabled entity:{args.wandb_entity} "
                     f"project:{args.wandb_project} run:{args.wandb_run_id}"
@@ -1108,9 +1111,12 @@ def main() -> None:
             "loader": train_loader.state_dict(),
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all(),
+            "best_val_bpb": best_val_bpb,
+            "initial_val_bpb": initial_val_bpb,
         }
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path)
+        checkpoint_bytes = path.stat().st_size
         latest = checkpoint_dir / f"{args.run_id}_latest.pt"
         latest_tmp = latest.with_suffix(latest.suffix + ".tmp")
         if latest_tmp.exists():
@@ -1121,7 +1127,16 @@ def main() -> None:
         except OSError:
             torch.save(payload, latest_tmp)
             os.replace(latest_tmp, latest)
-        log0(f"checkpoint_saved:{path} bytes:{path.stat().st_size}")
+        log0(f"checkpoint_saved:{path} bytes:{checkpoint_bytes}")
+        wandb_log(
+            {
+                "trainer/step": step,
+                "checkpoint/step": step,
+                "checkpoint/bytes": checkpoint_bytes,
+                "checkpoint/training_time_ms": training_time_ms,
+            },
+            step,
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1129,6 +1144,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     step = 0
+    best_val_bpb = math.inf
+    initial_val_bpb: float | None = None
     if args.resume_checkpoint:
         if world_size != 1:
             raise ValueError("RESUME_CHECKPOINT currently supports WORLD_SIZE=1")
@@ -1140,6 +1157,9 @@ def main() -> None:
         train_loader.load_state_dict(checkpoint["loader"])
         training_time_ms = float(checkpoint.get("training_time_ms", 0.0))
         step = int(checkpoint["step"])
+        best_val_bpb = float(checkpoint.get("best_val_bpb", math.inf))
+        checkpoint_initial_val_bpb = checkpoint.get("initial_val_bpb")
+        initial_val_bpb = None if checkpoint_initial_val_bpb is None else float(checkpoint_initial_val_bpb)
         if "rng_cpu" in checkpoint:
             torch.set_rng_state(checkpoint["rng_cpu"])
         if "rng_cuda" in checkpoint:
@@ -1172,15 +1192,44 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if initial_val_bpb is None:
+                initial_val_bpb = val_bpb
+            best_val_bpb = min(best_val_bpb, val_bpb)
+            target_gap = val_bpb - args.target_bpb
+            step_avg_ms = training_time_ms / max(step, 1)
             wandb_log(
                 {
+                    "trainer/step": step,
+                    "trainer/total_steps": args.iterations,
+                    "trainer/progress": step / max(args.iterations, 1),
+                    "progress/step": step,
+                    "progress/total_steps": args.iterations,
+                    "progress/fraction": step / max(args.iterations, 1),
+                    "progress/remaining_steps": max(args.iterations - step, 0),
                     "val/loss": val_loss,
                     "val/bpb": val_bpb,
+                    "val/perplexity": math.exp(min(val_loss, 20.0)),
                     "val_bpb": val_bpb,
                     "bpb": val_bpb,
                     "openai_parameter_golf/bpb": val_bpb,
+                    "fineweb/val_loss": val_loss,
+                    "fineweb/val_bpb": val_bpb,
+                    "fineweb/best_val_bpb": best_val_bpb,
+                    "fineweb/target_bpb": args.target_bpb,
+                    "fineweb/target_gap_bpb": target_gap,
+                    "fineweb/target_reached": float(best_val_bpb <= args.target_bpb),
+                    "bpb/val": val_bpb,
+                    "bpb/best": best_val_bpb,
+                    "bpb/target": args.target_bpb,
+                    "bpb/gap_to_target": target_gap,
+                    "bpb/improvement_from_initial": (
+                        0.0 if initial_val_bpb is None else initial_val_bpb - val_bpb
+                    ),
+                    "bpb/target_reached": float(best_val_bpb <= args.target_bpb),
                     "time/train_ms": training_time_ms,
-                    "time/step_avg_ms": training_time_ms / max(step, 1),
+                    "time/train_seconds": training_time_ms / 1000.0,
+                    "time/step_avg_ms": step_avg_ms,
+                    "time/steps_per_second": 1000.0 / max(step_avg_ms, 1e-9),
                 },
                 step,
             )
@@ -1231,17 +1280,41 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        step_avg_ms = approx_training_time_ms / step
+        tokens_per_second = args.train_batch_tokens * 1000.0 / max(step_avg_ms, 1e-9)
         if args.wandb_log_every > 0 and (step <= 10 or step % args.wandb_log_every == 0 or stop_after_step is not None):
-            wandb_log(
-                {
-                    "train/loss": float(train_loss.item()),
-                    "time/train_ms": approx_training_time_ms,
-                    "time/step_avg_ms": approx_training_time_ms / step,
-                    "optim/lr_scale": scale,
-                    "optim/muon_momentum": muon_momentum,
-                },
-                step,
-            )
+            train_metrics = {
+                "trainer/step": step,
+                "trainer/total_steps": args.iterations,
+                "trainer/progress": step / max(args.iterations, 1),
+                "progress/step": step,
+                "progress/total_steps": args.iterations,
+                "progress/fraction": step / max(args.iterations, 1),
+                "progress/remaining_steps": max(args.iterations - step, 0),
+                "train/loss": float(train_loss.item()),
+                "train/perplexity": math.exp(min(float(train_loss.item()), 20.0)),
+                "fineweb/train_loss": float(train_loss.item()),
+                "fineweb/train_time_ms": approx_training_time_ms,
+                "time/train_ms": approx_training_time_ms,
+                "time/train_seconds": approx_training_time_ms / 1000.0,
+                "time/step_avg_ms": step_avg_ms,
+                "time/steps_per_second": 1000.0 / max(step_avg_ms, 1e-9),
+                "perf/train_tokens_per_second": tokens_per_second,
+                "perf/train_tokens_per_step": args.train_batch_tokens,
+                "optim/lr_scale": scale,
+                "optim/muon_momentum": muon_momentum,
+                "optim/token_lr": token_lr * scale,
+                "optim/matrix_lr": args.matrix_lr * scale,
+                "optim/scalar_lr": args.scalar_lr * scale,
+            }
+            if device.type == "cuda":
+                train_metrics.update(
+                    {
+                        "system/vram_allocated_gb": torch.cuda.memory_allocated(device) / 1e9,
+                        "system/vram_reserved_gb": torch.cuda.memory_reserved(device) / 1e9,
+                    }
+                )
+            wandb_log(train_metrics, step)
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
