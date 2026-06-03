@@ -12,6 +12,7 @@ import io
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -53,6 +54,15 @@ class Hyperparameters:
     checkpoint_every = int(os.environ.get("CHECKPOINT_EVERY", 0))
     checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "checkpoints/training_opt_seq4096")
     resume_checkpoint = os.environ.get("RESUME_CHECKPOINT", "")
+    wandb_enabled = os.environ.get("WANDB", "1").lower() not in {"0", "false", "no", "off", "disabled"}
+    wandb_project = os.environ.get("WANDB_PROJECT", "toricgt-parameter-golf")
+    wandb_entity = os.environ.get("WANDB_ENTITY", "amelie-iska-math")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME", run_id)
+    wandb_run_id = os.environ.get("WANDB_RUN_ID", run_id)
+    wandb_resume = os.environ.get("WANDB_RESUME", "allow")
+    wandb_mode = os.environ.get("WANDB_MODE", "online")
+    wandb_key_path = os.environ.get("WANDB_KEY_PATH", "")
+    wandb_log_every = int(os.environ.get("WANDB_LOG_EVERY", 1))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -89,6 +99,46 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+
+SECRET_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
+
+
+def find_wandb_api_key(explicit_path: str = "") -> str | None:
+    if os.environ.get("WANDB_API_KEY"):
+        return os.environ["WANDB_API_KEY"]
+
+    candidate_paths: list[Path] = []
+    if explicit_path:
+        candidate_paths.append(Path(explicit_path))
+    candidate_paths.append(Path("keys.txt"))
+    for base in (Path.cwd(), Path(__file__).resolve().parent):
+        candidate_paths.extend(root / "keys.txt" for root in (base, *base.parents))
+
+    seen: set[Path] = set()
+    for path in candidate_paths:
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if "wandb" not in line.lower():
+                continue
+            tokens = [
+                token
+                for token in SECRET_TOKEN_RE.findall(line)
+                if token.lower() not in {"wandb", "api", "key", "apikey", "token"}
+            ]
+            if tokens:
+                return tokens[-1]
+    return None
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -937,6 +987,61 @@ def main() -> None:
         log0(f"resume_checkpoint:{args.resume_checkpoint}")
     log0(f"seed:{args.seed}")
 
+    wandb_run = None
+
+    def wandb_log(metrics: dict[str, float | int], step_for_wandb: int) -> None:
+        nonlocal wandb_run
+        if wandb_run is None:
+            return
+        try:
+            wandb_run.log(metrics, step=step_for_wandb)
+        except Exception as exc:
+            log0(f"wandb:log_disabled_after_error:{type(exc).__name__}")
+            wandb_run = None
+
+    if master_process and args.wandb_enabled:
+        wandb_api_key = find_wandb_api_key(args.wandb_key_path)
+        if wandb_api_key:
+            os.environ.setdefault("WANDB_API_KEY", wandb_api_key)
+        elif args.wandb_mode == "online":
+            log0("wandb:disabled reason:missing_api_key")
+        if wandb_api_key or args.wandb_mode != "online":
+            try:
+                import wandb
+
+                if wandb_api_key:
+                    wandb.login(key=wandb_api_key, relogin=False)
+                wandb_config = {
+                    name: getattr(args, name)
+                    for name in dir(args)
+                    if not name.startswith("_")
+                    and isinstance(getattr(args, name), (str, int, float, bool))
+                    and "key" not in name.lower()
+                }
+                wandb_config.update(
+                    {
+                        "model_params": n_params,
+                        "world_size": world_size,
+                        "grad_accum_steps": grad_accum_steps,
+                        "parameter_golf_record": "track_10min_16mb/2026-03-19_TrainingOptSeq4096",
+                    }
+                )
+                wandb_run = wandb.init(
+                    entity=args.wandb_entity or None,
+                    project=args.wandb_project,
+                    id=args.wandb_run_id,
+                    name=args.wandb_run_name,
+                    resume=args.wandb_resume,
+                    mode=args.wandb_mode,
+                    config=wandb_config,
+                )
+                log0(
+                    f"wandb:enabled entity:{args.wandb_entity} "
+                    f"project:{args.wandb_project} run:{args.wandb_run_id}"
+                )
+            except Exception as exc:
+                log0(f"wandb:disabled reason:{type(exc).__name__}")
+
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1067,6 +1172,15 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            wandb_log(
+                {
+                    "val/loss": val_loss,
+                    "val/bpb": val_bpb,
+                    "time/train_ms": training_time_ms,
+                    "time/step_avg_ms": training_time_ms / max(step, 1),
+                },
+                step,
+            )
             checkpoint_due = args.checkpoint_every > 0 and step > 0 and (last_step or step % args.checkpoint_every == 0)
             if checkpoint_due:
                 save_training_checkpoint(step, training_time_ms)
@@ -1114,6 +1228,17 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if args.wandb_log_every > 0 and (step <= 10 or step % args.wandb_log_every == 0 or stop_after_step is not None):
+            wandb_log(
+                {
+                    "train/loss": float(train_loss.item()),
+                    "time/train_ms": approx_training_time_ms,
+                    "time/step_avg_ms": approx_training_time_ms / step,
+                    "optim/lr_scale": scale,
+                    "optim/muon_momentum": muon_momentum,
+                },
+                step,
+            )
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1151,6 +1276,14 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        wandb_log(
+            {
+                "artifact/raw_model_bytes": model_bytes,
+                "artifact/code_bytes": code_bytes,
+                "artifact/raw_total_bytes": model_bytes + code_bytes,
+            },
+            step,
+        )
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
@@ -1169,6 +1302,16 @@ def main() -> None:
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        wandb_log(
+            {
+                "artifact/int8_zlib_model_bytes": quant_file_bytes,
+                "artifact/int8_zlib_total_bytes": quant_file_bytes + code_bytes,
+                "artifact/int8_payload_bytes": int(quant_stats["int8_payload_bytes"]),
+                "artifact/int8_raw_torch_bytes": quant_raw_bytes,
+                "artifact/int8_payload_ratio": ratio,
+            },
+            step,
+        )
 
     if distributed:
         dist.barrier()
@@ -1196,9 +1339,19 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    wandb_log(
+        {
+            "final/int8_zlib_roundtrip_loss": q_val_loss,
+            "final/int8_zlib_roundtrip_bpb": q_val_bpb,
+            "final/int8_zlib_roundtrip_eval_ms": 1000.0 * (time.perf_counter() - t_qeval),
+        },
+        step,
+    )
 
     if distributed:
         dist.destroy_process_group()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

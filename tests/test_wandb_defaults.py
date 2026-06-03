@@ -1,0 +1,28 @@
+from pathlib import Path
+import unittest
+
+
+SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "records"
+    / "track_10min_16mb"
+    / "2026-03-19_TrainingOptSeq4096"
+    / "train_gpt.py"
+)
+
+
+class WandbDefaultsTest(unittest.TestCase):
+    def test_training_script_enables_wandb_by_default_and_reads_local_keys(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('wandb_enabled = os.environ.get("WANDB", "1").lower() not in', source)
+        self.assertIn('wandb_project = os.environ.get("WANDB_PROJECT", "toricgt-parameter-golf")', source)
+        self.assertIn('wandb_entity = os.environ.get("WANDB_ENTITY", "amelie-iska-math")', source)
+        self.assertIn("find_wandb_api_key", source)
+        self.assertIn('Path("keys.txt")', source)
+        self.assertIn("wandb.init", source)
+        self.assertIn("wandb_run.log", source)
+
+
+if __name__ == "__main__":
+    unittest.main()
