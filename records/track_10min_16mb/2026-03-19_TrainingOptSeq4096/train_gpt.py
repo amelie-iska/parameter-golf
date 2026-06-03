@@ -106,6 +106,10 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    bigram_bias = os.environ.get("BIGRAM_BIAS", "0").lower() in {"1", "true", "yes", "on"}
+    bigram_bias_lr = float(os.environ.get("BIGRAM_BIAS_LR", 0.05))
+    bigram_bias_init_std = float(os.environ.get("BIGRAM_BIAS_INIT_STD", 0.0))
+    bigram_bias_scale = float(os.environ.get("BIGRAM_BIAS_SCALE", 1.0))
 
 
 SECRET_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
@@ -740,14 +744,21 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_bias: bool = False,
+        bigram_bias_init_std: float = 0.0,
+        bigram_bias_scale: float = 1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.vocab_size = vocab_size
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.bigram_bias_init_std = bigram_bias_init_std
+        self.bigram_bias_scale = bigram_bias_scale
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.prev_token_bias = nn.Embedding(vocab_size, vocab_size) if bigram_bias else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -774,6 +785,11 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.prev_token_bias is not None:
+            if self.bigram_bias_init_std > 0.0:
+                nn.init.normal_(self.prev_token_bias.weight, mean=0.0, std=self.bigram_bias_init_std)
+            else:
+                nn.init.zeros_(self.prev_token_bias.weight)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -801,6 +817,9 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        if self.prev_token_bias is not None:
+            transition_bias = self.prev_token_bias(input_ids.reshape(-1)).to(dtype=logits_proj.dtype)
+            logits_proj = logits_proj + transition_bias * self.bigram_bias_scale
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
@@ -916,6 +935,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_bias=args.bigram_bias,
+        bigram_bias_init_std=args.bigram_bias_init_std,
+        bigram_bias_scale=args.bigram_bias_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -964,6 +986,14 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.prev_token_bias is not None:
+        optimizer_bigram = torch.optim.Adam(
+            [{"params": [base_model.prev_token_bias.weight], "lr": args.bigram_bias_lr, "base_lr": args.bigram_bias_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_bigram)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -982,6 +1012,10 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"bigram_bias:{int(args.bigram_bias)} bigram_bias_lr:{args.bigram_bias_lr} "
+        f"bigram_bias_scale:{args.bigram_bias_scale}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1163,10 +1197,25 @@ def main() -> None:
         if world_size != 1:
             raise ValueError("RESUME_CHECKPOINT currently supports WORLD_SIZE=1")
         checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
-        base_model.load_state_dict(checkpoint["model"], strict=True)
+        load_result = base_model.load_state_dict(checkpoint["model"], strict=not args.bigram_bias)
+        if args.bigram_bias:
+            missing = sorted(load_result.missing_keys)
+            unexpected = sorted(load_result.unexpected_keys)
+            log0(f"resume_model_load:missing:{missing} unexpected:{unexpected}")
+            disallowed_missing = [key for key in missing if key != "prev_token_bias.weight"]
+            if disallowed_missing or unexpected:
+                raise RuntimeError(
+                    f"Unexpected checkpoint key mismatch with BIGRAM_BIAS=1: "
+                    f"missing={missing} unexpected={unexpected}"
+                )
         optimizer_states = checkpoint["optimizers"]
         if args.reset_optimizer_on_resume:
             log0("resume_optimizer_reset:1")
+        elif len(optimizer_states) != len(optimizers):
+            log0(
+                "resume_optimizer_reset:1 "
+                f"reason:optimizer_count_mismatch checkpoint:{len(optimizer_states)} current:{len(optimizers)}"
+            )
         else:
             for opt, state in zip(optimizers, optimizer_states, strict=True):
                 opt.load_state_dict(state)
@@ -1353,6 +1402,8 @@ def main() -> None:
                 "optim/matrix_lr": args.matrix_lr * scale,
                 "optim/scalar_lr": args.scalar_lr * scale,
             }
+            if base_model.prev_token_bias is not None:
+                train_metrics["optim/bigram_bias_lr"] = args.bigram_bias_lr * scale
             if device.type == "cuda":
                 train_metrics.update(
                     {
