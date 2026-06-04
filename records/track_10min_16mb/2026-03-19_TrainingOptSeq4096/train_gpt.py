@@ -70,6 +70,8 @@ class Hyperparameters:
     wandb_key_path = os.environ.get("WANDB_KEY_PATH", "")
     wandb_log_every = int(os.environ.get("WANDB_LOG_EVERY", 1))
     target_bpb = float(os.environ.get("TARGET_BPB", 1.2))
+    artifact_size_limit_bytes = int(os.environ.get("ARTIFACT_SIZE_LIMIT_BYTES", 16_000_000))
+    export_prune_fraction = float(os.environ.get("EXPORT_PRUNE_FRACTION", 0.0))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -499,6 +501,70 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
+
+
+def prune_state_dict_for_export(state_dict: dict[str, Tensor], fraction: float) -> tuple[dict[str, Tensor], int, int]:
+    frac = max(0.0, float(fraction))
+    if frac <= 0.0:
+        return {name: tensor.detach().to("cpu").contiguous() for name, tensor in state_dict.items()}, 0, 0
+    pruned: dict[str, Tensor] = {}
+    zeroed = 0
+    considered = 0
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        if t.is_floating_point() and t.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+            threshold = torch.quantile(t.float().abs().flatten(), min(frac, 1.0))
+            mask = t.float().abs() <= threshold
+            zeroed += int(mask.sum())
+            considered += int(mask.numel())
+            t = t.clone()
+            t[mask] = 0
+        pruned[name] = t
+    return pruned, zeroed, considered
+
+
+def quantized_export_blob_for_limit(
+    state_dict: dict[str, Tensor],
+    code_bytes: int,
+    artifact_size_limit_bytes: int,
+    export_prune_fraction: float,
+) -> tuple[bytes, dict[str, Tensor], dict[str, object], dict[str, float | int]]:
+    fractions = []
+    requested = max(0.0, float(export_prune_fraction))
+    if requested > 0.0:
+        fractions.append(requested)
+    fractions.extend([0.0, 0.03, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30])
+    seen = set()
+    best: tuple[bytes, dict[str, Tensor], dict[str, object], dict[str, float | int]] | None = None
+    for fraction in fractions:
+        fraction = round(float(fraction), 6)
+        if fraction in seen:
+            continue
+        seen.add(fraction)
+        candidate_state, zeroed, considered = prune_state_dict_for_export(state_dict, fraction)
+        quant_obj, quant_stats = quantize_state_dict_int8(candidate_state)
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        blob = zlib.compress(quant_raw, level=9)
+        metrics: dict[str, float | int] = {
+            "export_prune_fraction": fraction,
+            "export_pruned_values": zeroed,
+            "export_prune_considered_values": considered,
+            "int8_zlib_model_bytes": len(blob),
+            "int8_zlib_total_bytes": len(blob) + int(code_bytes),
+            "int8_raw_torch_bytes": len(quant_raw),
+            "int8_payload_bytes": int(quant_stats["int8_payload_bytes"]),
+            "int8_payload_ratio": (
+                float(quant_stats["baseline_tensor_bytes"]) / max(float(quant_stats["int8_payload_bytes"]), 1.0)
+            ),
+            "under_artifact_size_limit": int(len(blob) + int(code_bytes) <= int(artifact_size_limit_bytes)),
+        }
+        best = (blob, candidate_state, quant_obj, metrics)
+        if metrics["under_artifact_size_limit"]:
+            return best
+    assert best is not None
+    return best
 
 
 # -----------------------------
@@ -1731,30 +1797,40 @@ def main() -> None:
             step,
         )
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
+    quant_blob, export_state, quant_obj, export_metrics = quantized_export_blob_for_limit(
+        base_model.state_dict(),
+        code_bytes=code_bytes,
+        artifact_size_limit_bytes=args.artifact_size_limit_bytes,
+        export_prune_fraction=args.export_prune_fraction,
+    )
+    quant_raw_bytes = int(export_metrics["int8_raw_torch_bytes"])
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = float(export_metrics["int8_payload_ratio"])
+        total_bytes = quant_file_bytes + code_bytes
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"(payload:{int(export_metrics['int8_payload_bytes'])} raw_torch:{quant_raw_bytes} "
+            f"payload_ratio:{ratio:.2f}x export_prune:{float(export_metrics['export_prune_fraction']):.3f})"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(
+            f"Total submission size int8+zlib: {total_bytes} bytes "
+            f"limit:{args.artifact_size_limit_bytes} under_limit:{int(total_bytes <= args.artifact_size_limit_bytes)}"
+        )
         wandb_log(
             {
                 "artifact/int8_zlib_model_bytes": quant_file_bytes,
-                "artifact/int8_zlib_total_bytes": quant_file_bytes + code_bytes,
-                "artifact/int8_payload_bytes": int(quant_stats["int8_payload_bytes"]),
+                "artifact/int8_zlib_total_bytes": total_bytes,
+                "artifact/int8_payload_bytes": int(export_metrics["int8_payload_bytes"]),
                 "artifact/int8_raw_torch_bytes": quant_raw_bytes,
                 "artifact/int8_payload_ratio": ratio,
+                "artifact/export_prune_fraction": float(export_metrics["export_prune_fraction"]),
+                "artifact/export_pruned_values": int(export_metrics["export_pruned_values"]),
+                "artifact/export_prune_considered_values": int(export_metrics["export_prune_considered_values"]),
+                "artifact/size_limit_bytes": args.artifact_size_limit_bytes,
+                "artifact/under_size_limit": float(total_bytes <= args.artifact_size_limit_bytes),
             },
             step,
         )
