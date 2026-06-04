@@ -114,6 +114,16 @@ class Hyperparameters:
     bigram_bias_init_tokens = int(os.environ.get("BIGRAM_BIAS_INIT_TOKENS", 100_000_000))
     bigram_bias_init_alpha = float(os.environ.get("BIGRAM_BIAS_INIT_ALPHA", 0.1))
     bigram_bias_init_strength = float(os.environ.get("BIGRAM_BIAS_INIT_STRENGTH", 0.35))
+    hash_ngram_bias = os.environ.get("HASH_NGRAM_BIAS", "0").lower() in {"1", "true", "yes", "on"}
+    hash_ngram_bias_buckets = int(os.environ.get("HASH_NGRAM_BIAS_BUCKETS", 2048))
+    hash_ngram_bias_order = int(os.environ.get("HASH_NGRAM_BIAS_ORDER", 3))
+    hash_ngram_bias_lr = float(os.environ.get("HASH_NGRAM_BIAS_LR", 0.02))
+    hash_ngram_bias_scale = float(os.environ.get("HASH_NGRAM_BIAS_SCALE", 1.0))
+    hash_ngram_bias_init_std = float(os.environ.get("HASH_NGRAM_BIAS_INIT_STD", 0.0))
+    hash_ngram_bias_init_from_data = os.environ.get("HASH_NGRAM_BIAS_INIT_FROM_DATA", "0").lower() in {"1", "true", "yes", "on"}
+    hash_ngram_bias_init_tokens = int(os.environ.get("HASH_NGRAM_BIAS_INIT_TOKENS", 100_000_000))
+    hash_ngram_bias_init_alpha = float(os.environ.get("HASH_NGRAM_BIAS_INIT_ALPHA", 0.05))
+    hash_ngram_bias_init_strength = float(os.environ.get("HASH_NGRAM_BIAS_INIT_STRENGTH", 0.35))
 
 
 SECRET_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
@@ -596,6 +606,70 @@ def build_bigram_logit_bias_from_shards(
     return bias
 
 
+def hash_ngram_context_ids(input_ids: Tensor, num_buckets: int, order: int) -> Tensor:
+    if num_buckets <= 0:
+        raise ValueError("HASH_NGRAM_BIAS_BUCKETS must be positive")
+    context_order = max(1, int(order) - 1)
+    ids = input_ids.to(dtype=torch.int64)
+    hashed = torch.zeros_like(ids, dtype=torch.int64)
+    for offset in range(context_order):
+        shifted = torch.zeros_like(ids, dtype=torch.int64)
+        if offset == 0:
+            shifted = ids
+        elif ids.size(-1) > offset:
+            shifted[..., offset:] = ids[..., :-offset]
+        hashed = (hashed * 1_000_003 + shifted + 104_729 + offset * 9_176) % int(num_buckets)
+    return hashed
+
+
+def build_hash_ngram_logit_bias_from_shards(
+    pattern: str,
+    vocab_size: int,
+    num_buckets: int,
+    order: int,
+    max_tokens: int,
+    alpha: float,
+    strength: float,
+    log0,
+) -> Tensor:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    remaining: int | None = None if int(max_tokens) <= 0 else int(max_tokens)
+    counts = torch.full((num_buckets, vocab_size), float(alpha), dtype=torch.float32)
+    tail = torch.empty((0,), dtype=torch.int64)
+    total_tokens = 0
+    for file in files:
+        if remaining == 0:
+            break
+        take = remaining if remaining is not None else 2**63 - 1
+        tokens = load_data_shard_prefix(file, take)
+        if tokens.numel() == 0:
+            continue
+        read_count = int(tokens.numel())
+        ids = torch.cat((tail, tokens.to(dtype=torch.int64).reshape(-1))) if tail.numel() else tokens.to(dtype=torch.int64).reshape(-1)
+        if ids.numel() >= 2:
+            context = ids[:-1].unsqueeze(0)
+            target = ids[1:]
+            buckets = hash_ngram_context_ids(context, num_buckets, order).reshape(-1)
+            valid = (target >= 0) & (target < vocab_size)
+            flat = buckets[valid] * vocab_size + target[valid]
+            counts.add_(torch.bincount(flat, minlength=num_buckets * vocab_size).reshape(num_buckets, vocab_size).to(torch.float32))
+        keep = max(0, int(order) - 1)
+        tail = ids[-keep:].clone() if keep > 0 else torch.empty((0,), dtype=torch.int64)
+        total_tokens += read_count
+        if remaining is not None:
+            remaining = max(0, remaining - read_count)
+    log_probs = counts.log() - counts.sum(dim=1, keepdim=True).log()
+    bias = log_probs.mul(float(strength)).to(dtype=torch.float32)
+    log0(
+        "hash_ngram_bias_init_from_data:"
+        f"tokens:{total_tokens} files:{len(files)} buckets:{num_buckets} order:{order} "
+        f"alpha:{alpha} strength:{strength} bias_min:{float(bias.min()):.4f} bias_max:{float(bias.max()):.4f}"
+    )
+    return bias
+
+
 def initialize_bigram_bias_from_data_(model, args, log0, *, reason: str) -> None:
     if model.prev_token_bias is None:
         raise RuntimeError("BIGRAM_BIAS_INIT_FROM_DATA requires BIGRAM_BIAS=1")
@@ -614,6 +688,30 @@ def initialize_bigram_bias_from_data_(model, args, log0, *, reason: str) -> None
         "bigram_bias_init_from_data_applied:"
         f"reason:{reason} tokens:{args.bigram_bias_init_tokens} "
         f"alpha:{args.bigram_bias_init_alpha} strength:{args.bigram_bias_init_strength}"
+    )
+
+
+def initialize_hash_ngram_bias_from_data_(model, args, log0, *, reason: str) -> None:
+    if model.hash_ngram_bias is None:
+        raise RuntimeError("HASH_NGRAM_BIAS_INIT_FROM_DATA requires HASH_NGRAM_BIAS=1")
+    with torch.no_grad():
+        bias = build_hash_ngram_logit_bias_from_shards(
+            args.train_files,
+            args.vocab_size,
+            args.hash_ngram_bias_buckets,
+            args.hash_ngram_bias_order,
+            args.hash_ngram_bias_init_tokens,
+            args.hash_ngram_bias_init_alpha,
+            args.hash_ngram_bias_init_strength,
+            log0,
+        )
+        target = model.hash_ngram_bias.weight
+        target.copy_(bias.to(device=target.device, dtype=target.dtype))
+    log0(
+        "hash_ngram_bias_init_from_data_applied:"
+        f"reason:{reason} tokens:{args.hash_ngram_bias_init_tokens} "
+        f"buckets:{args.hash_ngram_bias_buckets} order:{args.hash_ngram_bias_order} "
+        f"alpha:{args.hash_ngram_bias_init_alpha} strength:{args.hash_ngram_bias_init_strength}"
     )
 
 
@@ -856,18 +954,30 @@ class GPT(nn.Module):
         bigram_bias: bool = False,
         bigram_bias_init_std: float = 0.0,
         bigram_bias_scale: float = 1.0,
+        hash_ngram_bias: bool = False,
+        hash_ngram_bias_buckets: int = 2048,
+        hash_ngram_bias_order: int = 3,
+        hash_ngram_bias_init_std: float = 0.0,
+        hash_ngram_bias_scale: float = 1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if hash_ngram_bias and hash_ngram_bias_order < 2:
+            raise ValueError("HASH_NGRAM_BIAS_ORDER must be at least 2")
         self.vocab_size = vocab_size
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.bigram_bias_init_std = bigram_bias_init_std
         self.bigram_bias_scale = bigram_bias_scale
+        self.hash_ngram_bias_buckets = hash_ngram_bias_buckets
+        self.hash_ngram_bias_order = hash_ngram_bias_order
+        self.hash_ngram_bias_init_std = hash_ngram_bias_init_std
+        self.hash_ngram_bias_scale = hash_ngram_bias_scale
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.prev_token_bias = nn.Embedding(vocab_size, vocab_size) if bigram_bias else None
+        self.hash_ngram_bias = nn.Embedding(hash_ngram_bias_buckets, vocab_size) if hash_ngram_bias else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -899,6 +1009,11 @@ class GPT(nn.Module):
                 nn.init.normal_(self.prev_token_bias.weight, mean=0.0, std=self.bigram_bias_init_std)
             else:
                 nn.init.zeros_(self.prev_token_bias.weight)
+        if self.hash_ngram_bias is not None:
+            if self.hash_ngram_bias_init_std > 0.0:
+                nn.init.normal_(self.hash_ngram_bias.weight, mean=0.0, std=self.hash_ngram_bias_init_std)
+            else:
+                nn.init.zeros_(self.hash_ngram_bias.weight)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -929,6 +1044,14 @@ class GPT(nn.Module):
         if self.prev_token_bias is not None:
             transition_bias = self.prev_token_bias(input_ids.reshape(-1)).to(dtype=logits_proj.dtype)
             logits_proj = logits_proj + transition_bias * self.bigram_bias_scale
+        if self.hash_ngram_bias is not None:
+            bucket_ids = hash_ngram_context_ids(
+                input_ids,
+                self.hash_ngram_bias_buckets,
+                self.hash_ngram_bias_order,
+            ).reshape(-1)
+            memory_bias = self.hash_ngram_bias(bucket_ids).to(dtype=logits_proj.dtype)
+            logits_proj = logits_proj + memory_bias * self.hash_ngram_bias_scale
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
@@ -1047,9 +1170,16 @@ def main() -> None:
         bigram_bias=args.bigram_bias,
         bigram_bias_init_std=args.bigram_bias_init_std,
         bigram_bias_scale=args.bigram_bias_scale,
+        hash_ngram_bias=args.hash_ngram_bias,
+        hash_ngram_bias_buckets=args.hash_ngram_bias_buckets,
+        hash_ngram_bias_order=args.hash_ngram_bias_order,
+        hash_ngram_bias_init_std=args.hash_ngram_bias_init_std,
+        hash_ngram_bias_scale=args.hash_ngram_bias_scale,
     )
     if args.bigram_bias and args.bigram_bias_init_from_data and not args.resume_checkpoint:
         initialize_bigram_bias_from_data_(base_model, args, log0, reason="fresh_init")
+    if args.hash_ngram_bias and args.hash_ngram_bias_init_from_data and not args.resume_checkpoint:
+        initialize_hash_ngram_bias_from_data_(base_model, args, log0, reason="fresh_init")
     base_model = base_model.to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1106,6 +1236,14 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_bigram)
+    if base_model.hash_ngram_bias is not None:
+        optimizer_hash_ngram = torch.optim.Adam(
+            [{"params": [base_model.hash_ngram_bias.weight], "lr": args.hash_ngram_bias_lr, "base_lr": args.hash_ngram_bias_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_hash_ngram)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1128,6 +1266,11 @@ def main() -> None:
     log0(
         f"bigram_bias:{int(args.bigram_bias)} bigram_bias_lr:{args.bigram_bias_lr} "
         f"bigram_bias_scale:{args.bigram_bias_scale}"
+    )
+    log0(
+        f"hash_ngram_bias:{int(args.hash_ngram_bias)} buckets:{args.hash_ngram_bias_buckets} "
+        f"order:{args.hash_ngram_bias_order} hash_ngram_bias_lr:{args.hash_ngram_bias_lr} "
+        f"hash_ngram_bias_scale:{args.hash_ngram_bias_scale}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1309,19 +1452,27 @@ def main() -> None:
         if world_size != 1:
             raise ValueError("RESUME_CHECKPOINT currently supports WORLD_SIZE=1")
         checkpoint = torch.load(args.resume_checkpoint, map_location="cpu")
-        load_result = base_model.load_state_dict(checkpoint["model"], strict=not args.bigram_bias)
-        if args.bigram_bias:
+        allow_new_bias_params = args.bigram_bias or args.hash_ngram_bias
+        load_result = base_model.load_state_dict(checkpoint["model"], strict=not allow_new_bias_params)
+        if allow_new_bias_params:
             missing = sorted(load_result.missing_keys)
             unexpected = sorted(load_result.unexpected_keys)
             log0(f"resume_model_load:missing:{missing} unexpected:{unexpected}")
-            disallowed_missing = [key for key in missing if key != "prev_token_bias.weight"]
+            allowed_missing = set()
+            if args.bigram_bias:
+                allowed_missing.add("prev_token_bias.weight")
+            if args.hash_ngram_bias:
+                allowed_missing.add("hash_ngram_bias.weight")
+            disallowed_missing = [key for key in missing if key not in allowed_missing]
             if disallowed_missing or unexpected:
                 raise RuntimeError(
-                    f"Unexpected checkpoint key mismatch with BIGRAM_BIAS=1: "
+                    f"Unexpected checkpoint key mismatch with optional bias params: "
                     f"missing={missing} unexpected={unexpected}"
                 )
         if args.bigram_bias and args.bigram_bias_init_from_data:
             initialize_bigram_bias_from_data_(base_model, args, log0, reason="after_resume_load")
+        if args.hash_ngram_bias and args.hash_ngram_bias_init_from_data:
+            initialize_hash_ngram_bias_from_data_(base_model, args, log0, reason="after_resume_load")
         optimizer_states = checkpoint["optimizers"]
         if args.reset_optimizer_on_resume:
             log0("resume_optimizer_reset:1")
@@ -1518,6 +1669,10 @@ def main() -> None:
             }
             if base_model.prev_token_bias is not None:
                 train_metrics["optim/bigram_bias_lr"] = args.bigram_bias_lr * scale
+            if base_model.hash_ngram_bias is not None:
+                train_metrics["optim/hash_ngram_bias_lr"] = args.hash_ngram_bias_lr * scale
+                train_metrics["memory/hash_ngram_bias_buckets"] = args.hash_ngram_bias_buckets
+                train_metrics["memory/hash_ngram_bias_order"] = args.hash_ngram_bias_order
             if device.type == "cuda":
                 train_metrics.update(
                     {
