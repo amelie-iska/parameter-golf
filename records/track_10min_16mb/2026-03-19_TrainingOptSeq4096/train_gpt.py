@@ -92,6 +92,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    polarquant_kv_bits = int(os.environ.get("POLARQUANT_KV_BITS", 0))
+    polarquant_train = os.environ.get("POLARQUANT_TRAIN", "0").lower() in {"1", "true", "yes", "on"}
+    polarquant_seed = int(os.environ.get("POLARQUANT_SEED", 271828))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -913,6 +916,55 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def hadamard_orthogonal_transform(x: Tensor) -> Tensor:
+    dim = x.size(-1)
+    y = x
+    h = 1
+    while h < dim:
+        y = y.reshape(*y.shape[:-1], dim // (h * 2), 2, h)
+        left = y[..., 0, :]
+        right = y[..., 1, :]
+        y = torch.stack((left + right, left - right), dim=-2).reshape(*x.shape[:-1], dim)
+        h *= 2
+    return y * (float(dim) ** -0.5)
+
+
+def recursive_polar_angle_quant_dequant(x: Tensor, bits: int) -> Tensor:
+    if bits <= 0 or x.size(-1) < 2 or (x.size(-1) & (x.size(-1) - 1)):
+        return x
+    signs = torch.where(x < 0, -torch.ones_like(x), torch.ones_like(x))
+    current = x.abs()
+    angles: list[Tensor] = []
+    levels = float((1 << int(bits)) - 1)
+    half_pi = math.pi / 2.0
+    while current.size(-1) > 1:
+        pair_dim = current.size(-1)
+        pairs = current.reshape(*current.shape[:-1], pair_dim // 2, 2)
+        left = pairs[..., 0]
+        right = pairs[..., 1]
+        radius = torch.sqrt(left.square() + right.square()).clamp_min(1e-12)
+        angle = torch.atan2(right, left).clamp(0.0, half_pi)
+        angles.append(torch.round(angle / half_pi * levels) / levels * half_pi)
+        current = radius
+    for angle in reversed(angles):
+        left = current * torch.cos(angle)
+        right = current * torch.sin(angle)
+        current = torch.stack((left, right), dim=-1).flatten(-2)
+    return current * signs
+
+
+def polarquant_kv_perturb(x: Tensor, signs: Tensor, bits: int) -> Tensor:
+    if bits <= 0 or x.size(-1) < 2 or (x.size(-1) & (x.size(-1) - 1)):
+        return x
+    original_dtype = x.dtype
+    sign_view = signs.view(*([1] * (x.ndim - 1)), x.size(-1))
+    signed = x.float() * sign_view
+    preconditioned = hadamard_orthogonal_transform(signed)
+    quantized = recursive_polar_angle_quant_dequant(preconditioned, bits)
+    restored = hadamard_orthogonal_transform(quantized) * sign_view
+    return restored.to(dtype=original_dtype)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -921,6 +973,10 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        polarquant_kv_bits: int = 0,
+        polarquant_train: bool = False,
+        polarquant_seed: int = 271828,
+        layer_idx: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -930,6 +986,8 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        self.polarquant_kv_bits = int(polarquant_kv_bits)
+        self.polarquant_train = bool(polarquant_train)
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
@@ -940,6 +998,14 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(int(polarquant_seed) + 104729 * int(layer_idx))
+        signs = torch.where(
+            torch.rand(self.head_dim, generator=gen) < 0.5,
+            torch.full((self.head_dim,), -1.0),
+            torch.ones(self.head_dim),
+        )
+        self.register_buffer("polarquant_signs", signs, persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -951,6 +1017,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+        if self.polarquant_kv_bits > 0 and (self.polarquant_train or not self.training):
+            k = polarquant_kv_perturb(k, self.polarquant_signs.to(device=k.device), self.polarquant_kv_bits)
+            v = polarquant_kv_perturb(v, self.polarquant_signs.to(device=v.device), self.polarquant_kv_bits)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -987,11 +1056,25 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        polarquant_kv_bits: int = 0,
+        polarquant_train: bool = False,
+        polarquant_seed: int = 271828,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            polarquant_kv_bits=polarquant_kv_bits,
+            polarquant_train=polarquant_train,
+            polarquant_seed=polarquant_seed,
+            layer_idx=layer_idx,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1028,6 +1111,9 @@ class GPT(nn.Module):
         hash_ngram_bias_order: int = 3,
         hash_ngram_bias_init_std: float = 0.0,
         hash_ngram_bias_scale: float = 1.0,
+        polarquant_kv_bits: int = 0,
+        polarquant_train: bool = False,
+        polarquant_seed: int = 271828,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1044,6 +1130,9 @@ class GPT(nn.Module):
         self.hash_ngram_bias_order = hash_ngram_bias_order
         self.hash_ngram_bias_init_std = hash_ngram_bias_init_std
         self.hash_ngram_bias_scale = hash_ngram_bias_scale
+        self.polarquant_kv_bits = int(polarquant_kv_bits)
+        self.polarquant_train = bool(polarquant_train)
+        self.polarquant_seed = int(polarquant_seed)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.prev_token_bias = nn.Embedding(vocab_size, vocab_size) if bigram_bias else None
         self.hash_ngram_bias = nn.Embedding(hash_ngram_bias_buckets, vocab_size) if hash_ngram_bias else None
@@ -1060,6 +1149,10 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    polarquant_kv_bits=self.polarquant_kv_bits,
+                    polarquant_train=self.polarquant_train,
+                    polarquant_seed=self.polarquant_seed,
+                    layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
@@ -1244,6 +1337,9 @@ def main() -> None:
         hash_ngram_bias_order=args.hash_ngram_bias_order,
         hash_ngram_bias_init_std=args.hash_ngram_bias_init_std,
         hash_ngram_bias_scale=args.hash_ngram_bias_scale,
+        polarquant_kv_bits=args.polarquant_kv_bits,
+        polarquant_train=args.polarquant_train,
+        polarquant_seed=args.polarquant_seed,
     )
     if args.bigram_bias and args.bigram_bias_init_from_data and not args.resume_checkpoint:
         initialize_bigram_bias_from_data_(base_model, args, log0, reason="fresh_init")
@@ -1327,6 +1423,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"polarquant_kv:bits:{args.polarquant_kv_bits} train:{int(args.polarquant_train)} "
+        f"seed:{args.polarquant_seed}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
