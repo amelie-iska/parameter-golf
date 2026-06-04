@@ -49,6 +49,7 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_sequences = int(os.environ.get("VAL_MAX_SEQUENCES", 0))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     checkpoint_every = int(os.environ.get("CHECKPOINT_EVERY", 0))
@@ -324,6 +325,8 @@ def eval_val(
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    if args.val_max_sequences > 0:
+        total_seqs = min(total_seqs, int(args.val_max_sequences))
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1311,7 +1314,10 @@ def main() -> None:
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1} "
+        f"max_sequences:{args.val_max_sequences if args.val_max_sequences > 0 else 'full'}"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
