@@ -132,6 +132,14 @@ class Hyperparameters:
     hash_ngram_bias_init_tokens = int(os.environ.get("HASH_NGRAM_BIAS_INIT_TOKENS", 100_000_000))
     hash_ngram_bias_init_alpha = float(os.environ.get("HASH_NGRAM_BIAS_INIT_ALPHA", 0.05))
     hash_ngram_bias_init_strength = float(os.environ.get("HASH_NGRAM_BIAS_INIT_STRENGTH", 0.35))
+    advanced_loss_scale = float(os.environ.get("ADVANCED_LOSS_SCALE", 0.0))
+    graphcg_loss_weight = float(os.environ.get("GRAPHCG_LOSS_WEIGHT", 0.0))
+    toric_tropical_loss_weight = float(os.environ.get("TORIC_TROPICAL_LOSS_WEIGHT", 0.0))
+    slepian_loss_weight = float(os.environ.get("SLEPIAN_LOSS_WEIGHT", 0.0))
+    koszul_bgg_loss_weight = float(os.environ.get("KOSZUL_BGG_LOSS_WEIGHT", 0.0))
+    analogy_loss_weight = float(os.environ.get("ANALOGY_LOSS_WEIGHT", 0.0))
+    advanced_loss_sample_tokens = int(os.environ.get("ADVANCED_LOSS_SAMPLE_TOKENS", 256))
+    toric_tropical_fan_bins = int(os.environ.get("TORIC_TROPICAL_FAN_BINS", 8))
 
 
 SECRET_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
@@ -172,6 +180,114 @@ def find_wandb_api_key(explicit_path: str = "") -> str | None:
             if tokens:
                 return tokens[-1]
     return None
+
+
+def _sample_current_embeddings(model: nn.Module, input_ids: Tensor, max_tokens: int) -> tuple[Tensor, Tensor]:
+    flat = input_ids.reshape(-1)
+    limit = max(4, int(max_tokens))
+    stride = max(flat.numel() // limit, 1)
+    seq_ids = flat[::stride][:limit]
+    vocab_ids = torch.unique(seq_ids)
+    if vocab_ids.numel() < 4:
+        vocab_ids = flat[: min(flat.numel(), limit)]
+        seq_ids = vocab_ids
+    emb = model.tok_emb.weight.index_select(0, vocab_ids).float()
+    seq = model.tok_emb(seq_ids).float()
+    return F.rms_norm(emb, (emb.size(-1),)), F.rms_norm(seq, (seq.size(-1),))
+
+
+def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+    scale = float(getattr(args, "advanced_loss_scale", 0.0))
+    weights = {
+        "graphcg": float(getattr(args, "graphcg_loss_weight", 0.0)),
+        "toric": float(getattr(args, "toric_tropical_loss_weight", 0.0)),
+        "slepian": float(getattr(args, "slepian_loss_weight", 0.0)),
+        "koszul": float(getattr(args, "koszul_bgg_loss_weight", 0.0)),
+        "analogy": float(getattr(args, "analogy_loss_weight", 0.0)),
+    }
+    zero = model.tok_emb.weight.float().sum() * 0.0
+    if scale <= 0.0 or max(weights.values()) <= 0.0:
+        return zero, {}
+    emb, seq = _sample_current_embeddings(model, input_ids, int(getattr(args, "advanced_loss_sample_tokens", 256)))
+    n = max(emb.size(0), 1)
+    metrics: dict[str, Tensor] = {}
+    total = zero
+
+    if weights["graphcg"] > 0.0:
+        cov = emb.T @ emb / float(n)
+        diag = torch.diagonal(cov)
+        off = cov - torch.diag(diag)
+        graphcg = off.square().mean() / (diag.square().mean().detach() + 1e-6)
+        probs = (diag.abs() + 1e-6) / (diag.abs().sum() + 1e-6)
+        entropy = -(probs * probs.log()).sum() / math.log(max(probs.numel(), 2))
+        total = total + scale * weights["graphcg"] * graphcg
+        metrics.update({
+            "advanced/graphcg_loss": graphcg.detach(),
+            "advanced/graphcg_spectral_entropy": entropy.detach(),
+            "advanced/graphcg_offdiag_coherence": off.detach().abs().mean(),
+        })
+
+    if weights["toric"] > 0.0:
+        k = max(4, int(getattr(args, "toric_tropical_fan_bins", 8)))
+        theta = torch.linspace(0.0, 2.0 * math.pi, k + 1, device=emb.device, dtype=emb.dtype)[:-1]
+        rays = torch.stack((torch.cos(theta), torch.sin(theta)), dim=1)
+        phase = emb[:, :2] if emb.size(1) >= 2 else F.pad(emb, (0, 2 - emb.size(1)))
+        logits = phase @ rays.T
+        probs = torch.softmax(logits, dim=-1)
+        chamber = probs.mean(dim=0)
+        entropy = -(chamber * (chamber + 1e-6).log()).sum() / math.log(k)
+        top2 = torch.topk(logits, k=2, dim=-1).values
+        margin = top2[:, 0] - top2[:, 1]
+        toric = (1.0 - entropy) + F.relu(0.15 - margin).mean()
+        total = total + scale * weights["toric"] * toric
+        metrics.update({
+            "advanced/toric_tropical_loss": toric.detach(),
+            "advanced/toric_fan_entropy": entropy.detach(),
+            "advanced/tropical_active_face_margin": margin.detach().mean(),
+        })
+
+    if weights["slepian"] > 0.0 and seq.size(0) >= 8:
+        centered = seq - seq.mean(dim=0, keepdim=True)
+        spec = torch.fft.rfft(centered, dim=0)
+        power = spec.real.square() + spec.imag.square()
+        low = max(2, power.size(0) // 5)
+        concentration = power[:low].sum() / (power.sum() + 1e-6)
+        slepian = 1.0 - concentration
+        total = total + scale * weights["slepian"] * slepian
+        metrics.update({
+            "advanced/slepian_pollak_loss": slepian.detach(),
+            "advanced/slepian_concentration": concentration.detach(),
+            "advanced/slepian_leakage": (1.0 - concentration).detach(),
+        })
+
+    if weights["koszul"] > 0.0:
+        r = max(2, min(16, emb.size(1) // 3))
+        a, b, c = emb[:, :r], emb[:, r : 2 * r], emb[:, 2 * r : 3 * r]
+        d1 = a.T @ b / float(n)
+        d2 = b.T @ c / float(n)
+        d2_resid = (d1 @ d2).square().mean() / ((d1.square().mean() * d2.square().mean()).detach() + 1e-6)
+        leakage = (a.T @ c / float(n)).square().mean() / ((a.square().mean() * c.square().mean()).detach() + 1e-6)
+        koszul = d2_resid + 0.25 * leakage
+        total = total + scale * weights["koszul"] * koszul
+        metrics.update({
+            "advanced/koszul_bgg_loss": koszul.detach(),
+            "advanced/koszul_d2_residual": d2_resid.detach(),
+            "advanced/bgg_standard_leakage": leakage.detach(),
+        })
+
+    if weights["analogy"] > 0.0 and seq.size(0) >= 6:
+        deltas = seq[1:] - seq[:-1]
+        analogue = (deltas[2:] - deltas[:-2]).square().mean()
+        denom = deltas.square().mean().detach() + 1e-6
+        analogy = analogue / denom
+        total = total + scale * weights["analogy"] * analogy
+        metrics.update({
+            "advanced/analogy_loss": analogy.detach(),
+            "advanced/analogical_transport_residual": analogy.detach(),
+        })
+
+    metrics["advanced/aux_loss"] = total.detach()
+    return total, metrics
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1489,6 +1605,13 @@ def main() -> None:
         f"hash_ngram_bias_scale:{args.hash_ngram_bias_scale}"
     )
     log0(
+        "advanced_losses:"
+        f"scale:{args.advanced_loss_scale} graphcg:{args.graphcg_loss_weight} "
+        f"toric_tropical:{args.toric_tropical_loss_weight} slepian:{args.slepian_loss_weight} "
+        f"koszul_bgg:{args.koszul_bgg_loss_weight} analogy:{args.analogy_loss_weight} "
+        f"sample_tokens:{args.advanced_loss_sample_tokens} fan_bins:{args.toric_tropical_fan_bins}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
@@ -1804,6 +1927,8 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        train_aux_loss = torch.zeros((), device=device)
+        advanced_metric_sums: dict[str, Tensor] = {}
         train_token_count = torch.zeros((), device=device, dtype=torch.float64)
         train_byte_count = torch.zeros((), device=device, dtype=torch.float64)
         for micro_step in range(grad_accum_steps):
@@ -1811,8 +1936,13 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
+                ce_loss = model(x, y)
+            aux_loss, aux_metrics = advanced_embedding_losses(base_model, args, x)
+            loss = ce_loss + aux_loss
+            train_loss += ce_loss.detach()
+            train_aux_loss += aux_loss.detach()
+            for key, value in aux_metrics.items():
+                advanced_metric_sums[key] = advanced_metric_sums.get(key, torch.zeros((), device=device)) + value.detach()
             (loss * grad_scale).backward()
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
@@ -1821,9 +1951,16 @@ def main() -> None:
             train_token_count += float(tgt_ids.numel())
             train_byte_count += token_bytes.to(torch.float64).sum()
         train_loss /= grad_accum_steps
+        train_aux_loss /= grad_accum_steps
+        advanced_metric_avgs = {key: value / grad_accum_steps for key, value in advanced_metric_sums.items()}
         if distributed:
             dist.all_reduce(train_token_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(train_byte_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(train_aux_loss, op=dist.ReduceOp.SUM)
+            train_aux_loss /= world_size
+            for key in list(advanced_metric_avgs):
+                dist.all_reduce(advanced_metric_avgs[key], op=dist.ReduceOp.SUM)
+                advanced_metric_avgs[key] /= world_size
 
         train_bits_per_token = float(train_loss.item()) / math.log(2.0)
         train_tokens_per_byte = float(train_token_count.item()) / max(float(train_byte_count.item()), 1.0)
@@ -1858,6 +1995,8 @@ def main() -> None:
                 "progress/fraction": step / max(args.iterations, 1),
                 "progress/remaining_steps": max(args.iterations - step, 0),
                 "train/loss": float(train_loss.item()),
+                "train/total_loss": float((train_loss + train_aux_loss).item()),
+                "train/advanced_aux_loss": float(train_aux_loss.item()),
                 "train/perplexity": math.exp(min(float(train_loss.item()), 20.0)),
                 "train/bpb": train_bpb,
                 "train_bpb": train_bpb,
@@ -1889,6 +2028,8 @@ def main() -> None:
                 train_metrics["optim/hash_ngram_bias_lr"] = args.hash_ngram_bias_lr * scale
                 train_metrics["memory/hash_ngram_bias_buckets"] = args.hash_ngram_bias_buckets
                 train_metrics["memory/hash_ngram_bias_order"] = args.hash_ngram_bias_order
+            if advanced_metric_avgs:
+                train_metrics.update({key: float(value.item()) for key, value in advanced_metric_avgs.items()})
             if device.type == "cuda":
                 train_metrics.update(
                     {
