@@ -596,6 +596,27 @@ def build_bigram_logit_bias_from_shards(
     return bias
 
 
+def initialize_bigram_bias_from_data_(model, args, log0, *, reason: str) -> None:
+    if model.prev_token_bias is None:
+        raise RuntimeError("BIGRAM_BIAS_INIT_FROM_DATA requires BIGRAM_BIAS=1")
+    with torch.no_grad():
+        bias = build_bigram_logit_bias_from_shards(
+            args.train_files,
+            args.vocab_size,
+            args.bigram_bias_init_tokens,
+            args.bigram_bias_init_alpha,
+            args.bigram_bias_init_strength,
+            log0,
+        )
+        target = model.prev_token_bias.weight
+        target.copy_(bias.to(device=target.device, dtype=target.dtype))
+    log0(
+        "bigram_bias_init_from_data_applied:"
+        f"reason:{reason} tokens:{args.bigram_bias_init_tokens} "
+        f"alpha:{args.bigram_bias_init_alpha} strength:{args.bigram_bias_init_strength}"
+    )
+
+
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -1027,20 +1048,8 @@ def main() -> None:
         bigram_bias_init_std=args.bigram_bias_init_std,
         bigram_bias_scale=args.bigram_bias_scale,
     )
-    if args.bigram_bias and args.bigram_bias_init_from_data:
-        if base_model.prev_token_bias is None:
-            raise RuntimeError("BIGRAM_BIAS_INIT_FROM_DATA requires BIGRAM_BIAS=1")
-        with torch.no_grad():
-            base_model.prev_token_bias.weight.copy_(
-                build_bigram_logit_bias_from_shards(
-                    args.train_files,
-                    args.vocab_size,
-                    args.bigram_bias_init_tokens,
-                    args.bigram_bias_init_alpha,
-                    args.bigram_bias_init_strength,
-                    log0,
-                )
-            )
+    if args.bigram_bias and args.bigram_bias_init_from_data and not args.resume_checkpoint:
+        initialize_bigram_bias_from_data_(base_model, args, log0, reason="fresh_init")
     base_model = base_model.to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1311,6 +1320,8 @@ def main() -> None:
                     f"Unexpected checkpoint key mismatch with BIGRAM_BIAS=1: "
                     f"missing={missing} unexpected={unexpected}"
                 )
+        if args.bigram_bias and args.bigram_bias_init_from_data:
+            initialize_bigram_bias_from_data_(base_model, args, log0, reason="after_resume_load")
         optimizer_states = checkpoint["optimizers"]
         if args.reset_optimizer_on_resume:
             log0("resume_optimizer_reset:1")
