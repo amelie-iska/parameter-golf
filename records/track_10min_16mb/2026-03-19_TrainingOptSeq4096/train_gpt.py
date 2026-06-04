@@ -73,6 +73,13 @@ class Hyperparameters:
     target_bpb = float(os.environ.get("TARGET_BPB", 1.2))
     artifact_size_limit_bytes = int(os.environ.get("ARTIFACT_SIZE_LIMIT_BYTES", 16_000_000))
     export_prune_fraction = float(os.environ.get("EXPORT_PRUNE_FRACTION", 0.0))
+    checkpoint_on_train_bpb_below = float(os.environ.get("CHECKPOINT_ON_TRAIN_BPB_BELOW", 0.0))
+    checkpoint_on_train_bpb_cooldown_steps = int(os.environ.get("CHECKPOINT_ON_TRAIN_BPB_COOLDOWN_STEPS", 25))
+    checkpoint_on_train_bpb_max = int(os.environ.get("CHECKPOINT_ON_TRAIN_BPB_MAX", 4))
+    val_on_train_bpb_checkpoint = os.environ.get(
+        "VAL_ON_TRAIN_BPB_CHECKPOINT",
+        "1",
+    ).lower() in {"1", "true", "yes", "on"}
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -1780,8 +1787,15 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    def save_training_checkpoint(step: int, training_time_ms: float) -> None:
-        if not master_process or args.checkpoint_every <= 0:
+    def save_training_checkpoint(
+        step: int,
+        training_time_ms: float,
+        *,
+        force: bool = False,
+        reason: str = "scheduled",
+        extra_metrics: dict[str, float] | None = None,
+    ) -> None:
+        if not master_process or (args.checkpoint_every <= 0 and not force):
             return
         checkpoint_dir = Path(args.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1811,16 +1825,17 @@ def main() -> None:
         except OSError:
             torch.save(payload, latest_tmp)
             os.replace(latest_tmp, latest)
-        log0(f"checkpoint_saved:{path} bytes:{checkpoint_bytes}")
-        wandb_log(
-            {
-                "trainer/step": step,
-                "checkpoint/step": step,
-                "checkpoint/bytes": checkpoint_bytes,
-                "checkpoint/training_time_ms": training_time_ms,
-            },
-            step,
-        )
+        log0(f"checkpoint_saved:{path} bytes:{checkpoint_bytes} reason:{reason}")
+        metrics = {
+            "trainer/step": step,
+            "checkpoint/step": step,
+            "checkpoint/bytes": checkpoint_bytes,
+            "checkpoint/training_time_ms": training_time_ms,
+            "checkpoint/reason_low_train_bpb": float(reason == "low_train_bpb"),
+        }
+        if extra_metrics:
+            metrics.update(extra_metrics)
+        wandb_log(metrics, step)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1830,6 +1845,8 @@ def main() -> None:
     step = 0
     best_val_bpb = math.inf
     initial_val_bpb: float | None = None
+    low_train_bpb_checkpoint_count = 0
+    last_low_train_bpb_checkpoint_step = -1_000_000_000
     if args.resume_checkpoint:
         if world_size != 1:
             raise ValueError("RESUME_CHECKPOINT currently supports WORLD_SIZE=1")
@@ -2111,6 +2128,79 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
                 f"train_bpb:{train_bpb:.4f}"
             )
+
+        low_train_bpb_triggered = (
+            args.checkpoint_on_train_bpb_below > 0.0
+            and train_bpb <= args.checkpoint_on_train_bpb_below
+            and low_train_bpb_checkpoint_count < max(args.checkpoint_on_train_bpb_max, 0)
+            and step - last_low_train_bpb_checkpoint_step
+            >= max(args.checkpoint_on_train_bpb_cooldown_steps, 1)
+        )
+        if low_train_bpb_triggered:
+            torch.cuda.synchronize()
+            training_time_ms = approx_training_time_ms
+            trigger_metrics = {
+                "trigger/low_train_bpb": 1.0,
+                "trigger/low_train_bpb_threshold": args.checkpoint_on_train_bpb_below,
+                "trigger/train_bpb": train_bpb,
+                "trigger/train_loss": float(train_loss.item()),
+                "trigger/advanced_aux_loss": float(train_aux_loss.item()),
+            }
+            if args.val_on_train_bpb_checkpoint:
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+                if initial_val_bpb is None:
+                    initial_val_bpb = val_bpb
+                best_val_bpb = min(best_val_bpb, val_bpb)
+                log0(
+                    f"low_train_bpb_trigger_val step:{step}/{args.iterations} "
+                    f"train_bpb:{train_bpb:.4f} threshold:{args.checkpoint_on_train_bpb_below:.4f} "
+                    f"val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms"
+                )
+                trigger_metrics.update(
+                    {
+                        "trigger/val_loss": val_loss,
+                        "trigger/val_bpb": val_bpb,
+                        "trigger/best_val_bpb": best_val_bpb,
+                        "val/loss": val_loss,
+                        "val/bpb": val_bpb,
+                        "val_bpb": val_bpb,
+                        "bpb": val_bpb,
+                        "openai_parameter_golf/bpb": val_bpb,
+                        "fineweb/val_bpb": val_bpb,
+                        "fineweb/best_val_bpb": best_val_bpb,
+                        "bpb/best": best_val_bpb,
+                    }
+                )
+            log0(
+                f"low_train_bpb_trigger_checkpoint step:{step}/{args.iterations} "
+                f"train_bpb:{train_bpb:.4f} threshold:{args.checkpoint_on_train_bpb_below:.4f} "
+                f"count:{low_train_bpb_checkpoint_count + 1}/{args.checkpoint_on_train_bpb_max}"
+            )
+            save_training_checkpoint(
+                step,
+                training_time_ms,
+                force=True,
+                reason="low_train_bpb",
+                extra_metrics=trigger_metrics,
+            )
+            low_train_bpb_checkpoint_count += 1
+            last_low_train_bpb_checkpoint_step = step
+            if distributed:
+                dist.barrier()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
