@@ -34,6 +34,13 @@ class Args:
     analogy_loss_weight = 0.01
     advanced_loss_sample_tokens = 16
     toric_tropical_fan_bins = 8
+    advanced_loss_log_only = False
+    advanced_loss_start_step = 0
+    advanced_loss_end_step = 0
+    advanced_loss_every = 1
+    advanced_loss_warmup_steps = 0
+    advanced_loss_min_best_val_bpb = 0.0
+    advanced_loss_max_ce_ratio = 0.0
 
 
 def tiny_model(module):
@@ -83,3 +90,42 @@ def test_advanced_embedding_losses_can_be_disabled() -> None:
 
     assert loss.item() == 0.0
     assert metrics == {}
+
+
+def test_advanced_embedding_losses_log_only_without_backprop() -> None:
+    module = load_module()
+    model = tiny_model(module)
+    input_ids = torch.arange(48, dtype=torch.long).reshape(2, 24) % 32
+
+    class LogOnly(Args):
+        advanced_loss_scale = 0.0
+        advanced_loss_log_only = True
+
+    loss, metrics = module.advanced_embedding_losses(model, LogOnly, input_ids, runtime_scale=0.0)
+
+    assert loss.item() == 0.0
+    assert metrics["advanced/graphcg_loss"].isfinite()
+    assert metrics["advanced/weighted_unscaled_loss"].isfinite()
+    assert metrics["advanced/runtime_scale"].item() == 0.0
+    loss.backward()
+    assert model.tok_emb.weight.grad is not None
+    assert model.tok_emb.weight.grad.abs().sum().item() == 0.0
+
+
+def test_advanced_loss_runtime_scale_uses_schedule_and_best_val_gate() -> None:
+    module = load_module()
+
+    class Scheduled(Args):
+        advanced_loss_scale = 0.03
+        advanced_loss_start_step = 100
+        advanced_loss_end_step = 110
+        advanced_loss_every = 2
+        advanced_loss_warmup_steps = 4
+        advanced_loss_min_best_val_bpb = 1.205
+
+    assert module.advanced_loss_runtime_scale(Scheduled, 99, 1.200) == 0.0
+    assert module.advanced_loss_runtime_scale(Scheduled, 100, 1.210) == 0.0
+    assert module.advanced_loss_runtime_scale(Scheduled, 101, 1.200) == 0.0
+    assert module.advanced_loss_runtime_scale(Scheduled, 110, 1.200) == 0.0
+    assert module.advanced_loss_runtime_scale(Scheduled, 100, 1.200) == 0.03 / 4.0
+    assert module.advanced_loss_runtime_scale(Scheduled, 106, 1.200) == 0.03

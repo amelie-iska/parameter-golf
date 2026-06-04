@@ -140,6 +140,13 @@ class Hyperparameters:
     analogy_loss_weight = float(os.environ.get("ANALOGY_LOSS_WEIGHT", 0.0))
     advanced_loss_sample_tokens = int(os.environ.get("ADVANCED_LOSS_SAMPLE_TOKENS", 256))
     toric_tropical_fan_bins = int(os.environ.get("TORIC_TROPICAL_FAN_BINS", 8))
+    advanced_loss_log_only = os.environ.get("ADVANCED_LOSS_LOG_ONLY", "0").lower() in {"1", "true", "yes", "on"}
+    advanced_loss_start_step = int(os.environ.get("ADVANCED_LOSS_START_STEP", 0))
+    advanced_loss_end_step = int(os.environ.get("ADVANCED_LOSS_END_STEP", 0))
+    advanced_loss_every = int(os.environ.get("ADVANCED_LOSS_EVERY", 1))
+    advanced_loss_warmup_steps = int(os.environ.get("ADVANCED_LOSS_WARMUP_STEPS", 0))
+    advanced_loss_min_best_val_bpb = float(os.environ.get("ADVANCED_LOSS_MIN_BEST_VAL_BPB", 0.0))
+    advanced_loss_max_ce_ratio = float(os.environ.get("ADVANCED_LOSS_MAX_CE_RATIO", 0.0))
 
 
 SECRET_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
@@ -196,8 +203,13 @@ def _sample_current_embeddings(model: nn.Module, input_ids: Tensor, max_tokens: 
     return F.rms_norm(emb, (emb.size(-1),)), F.rms_norm(seq, (seq.size(-1),))
 
 
-def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
-    scale = float(getattr(args, "advanced_loss_scale", 0.0))
+def advanced_embedding_losses(
+    model: nn.Module,
+    args: object,
+    input_ids: Tensor,
+    runtime_scale: float | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    scale = float(getattr(args, "advanced_loss_scale", 0.0) if runtime_scale is None else runtime_scale)
     weights = {
         "graphcg": float(getattr(args, "graphcg_loss_weight", 0.0)),
         "toric": float(getattr(args, "toric_tropical_loss_weight", 0.0)),
@@ -206,12 +218,13 @@ def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor)
         "analogy": float(getattr(args, "analogy_loss_weight", 0.0)),
     }
     zero = model.tok_emb.weight.float().sum() * 0.0
-    if scale <= 0.0 or max(weights.values()) <= 0.0:
+    log_only = bool(getattr(args, "advanced_loss_log_only", False))
+    if (scale <= 0.0 and not log_only) or max(weights.values()) <= 0.0:
         return zero, {}
     emb, seq = _sample_current_embeddings(model, input_ids, int(getattr(args, "advanced_loss_sample_tokens", 256)))
     n = max(emb.size(0), 1)
     metrics: dict[str, Tensor] = {}
-    total = zero
+    weighted = zero
 
     if weights["graphcg"] > 0.0:
         cov = emb.T @ emb / float(n)
@@ -220,7 +233,7 @@ def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor)
         graphcg = off.square().mean() / (diag.square().mean().detach() + 1e-6)
         probs = (diag.abs() + 1e-6) / (diag.abs().sum() + 1e-6)
         entropy = -(probs * probs.log()).sum() / math.log(max(probs.numel(), 2))
-        total = total + scale * weights["graphcg"] * graphcg
+        weighted = weighted + weights["graphcg"] * graphcg
         metrics.update({
             "advanced/graphcg_loss": graphcg.detach(),
             "advanced/graphcg_spectral_entropy": entropy.detach(),
@@ -239,7 +252,7 @@ def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor)
         top2 = torch.topk(logits, k=2, dim=-1).values
         margin = top2[:, 0] - top2[:, 1]
         toric = (1.0 - entropy) + F.relu(0.15 - margin).mean()
-        total = total + scale * weights["toric"] * toric
+        weighted = weighted + weights["toric"] * toric
         metrics.update({
             "advanced/toric_tropical_loss": toric.detach(),
             "advanced/toric_fan_entropy": entropy.detach(),
@@ -253,7 +266,7 @@ def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor)
         low = max(2, power.size(0) // 5)
         concentration = power[:low].sum() / (power.sum() + 1e-6)
         slepian = 1.0 - concentration
-        total = total + scale * weights["slepian"] * slepian
+        weighted = weighted + weights["slepian"] * slepian
         metrics.update({
             "advanced/slepian_pollak_loss": slepian.detach(),
             "advanced/slepian_concentration": concentration.detach(),
@@ -268,7 +281,7 @@ def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor)
         d2_resid = (d1 @ d2).square().mean() / ((d1.square().mean() * d2.square().mean()).detach() + 1e-6)
         leakage = (a.T @ c / float(n)).square().mean() / ((a.square().mean() * c.square().mean()).detach() + 1e-6)
         koszul = d2_resid + 0.25 * leakage
-        total = total + scale * weights["koszul"] * koszul
+        weighted = weighted + weights["koszul"] * koszul
         metrics.update({
             "advanced/koszul_bgg_loss": koszul.detach(),
             "advanced/koszul_d2_residual": d2_resid.detach(),
@@ -280,14 +293,39 @@ def advanced_embedding_losses(model: nn.Module, args: object, input_ids: Tensor)
         analogue = (deltas[2:] - deltas[:-2]).square().mean()
         denom = deltas.square().mean().detach() + 1e-6
         analogy = analogue / denom
-        total = total + scale * weights["analogy"] * analogy
+        weighted = weighted + weights["analogy"] * analogy
         metrics.update({
             "advanced/analogy_loss": analogy.detach(),
             "advanced/analogical_transport_residual": analogy.detach(),
         })
 
+    total = scale * weighted
+    metrics["advanced/weighted_unscaled_loss"] = weighted.detach()
+    metrics["advanced/runtime_scale"] = torch.as_tensor(scale, device=weighted.device, dtype=weighted.dtype)
     metrics["advanced/aux_loss"] = total.detach()
     return total, metrics
+
+
+def advanced_loss_runtime_scale(args: object, step: int, best_val_bpb: float) -> float:
+    scale = float(getattr(args, "advanced_loss_scale", 0.0))
+    if scale <= 0.0:
+        return 0.0
+    start_step = int(getattr(args, "advanced_loss_start_step", 0))
+    if step < start_step:
+        return 0.0
+    end_step = int(getattr(args, "advanced_loss_end_step", 0))
+    if end_step > 0 and step >= end_step:
+        return 0.0
+    every = max(1, int(getattr(args, "advanced_loss_every", 1)))
+    if every > 1 and (step - start_step) % every != 0:
+        return 0.0
+    min_best_val = float(getattr(args, "advanced_loss_min_best_val_bpb", 0.0))
+    if min_best_val > 0.0 and (not math.isfinite(best_val_bpb) or best_val_bpb > min_best_val):
+        return 0.0
+    warmup = int(getattr(args, "advanced_loss_warmup_steps", 0))
+    if warmup > 0:
+        scale *= min(max(step - start_step + 1, 0) / float(warmup), 1.0)
+    return scale
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1609,7 +1647,12 @@ def main() -> None:
         f"scale:{args.advanced_loss_scale} graphcg:{args.graphcg_loss_weight} "
         f"toric_tropical:{args.toric_tropical_loss_weight} slepian:{args.slepian_loss_weight} "
         f"koszul_bgg:{args.koszul_bgg_loss_weight} analogy:{args.analogy_loss_weight} "
-        f"sample_tokens:{args.advanced_loss_sample_tokens} fan_bins:{args.toric_tropical_fan_bins}"
+        f"sample_tokens:{args.advanced_loss_sample_tokens} fan_bins:{args.toric_tropical_fan_bins} "
+        f"log_only:{int(args.advanced_loss_log_only)} start_step:{args.advanced_loss_start_step} "
+        f"end_step:{args.advanced_loss_end_step} every:{args.advanced_loss_every} "
+        f"warmup_steps:{args.advanced_loss_warmup_steps} "
+        f"min_best_val_bpb:{args.advanced_loss_min_best_val_bpb} "
+        f"max_ce_ratio:{args.advanced_loss_max_ce_ratio}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1929,6 +1972,7 @@ def main() -> None:
         train_loss = torch.zeros((), device=device)
         train_aux_loss = torch.zeros((), device=device)
         advanced_metric_sums: dict[str, Tensor] = {}
+        advanced_runtime_scale_sum = torch.zeros((), device=device)
         train_token_count = torch.zeros((), device=device, dtype=torch.float64)
         train_byte_count = torch.zeros((), device=device, dtype=torch.float64)
         for micro_step in range(grad_accum_steps):
@@ -1937,10 +1981,24 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 ce_loss = model(x, y)
-            aux_loss, aux_metrics = advanced_embedding_losses(base_model, args, x)
+            runtime_scale = advanced_loss_runtime_scale(args, step, best_val_bpb)
+            aux_loss, aux_metrics = advanced_embedding_losses(base_model, args, x, runtime_scale=runtime_scale)
+            if runtime_scale > 0.0 and args.advanced_loss_max_ce_ratio > 0.0:
+                max_aux_loss = ce_loss.detach() * args.advanced_loss_max_ce_ratio
+                aux_loss = torch.minimum(aux_loss, max_aux_loss)
+                aux_metrics["advanced/aux_loss_clamp_ce_ratio"] = torch.as_tensor(
+                    args.advanced_loss_max_ce_ratio,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                aux_metrics["advanced/aux_loss_clamped"] = (
+                    aux_loss.detach() < aux_metrics.get("advanced/aux_loss", aux_loss.detach())
+                ).to(dtype=torch.float32)
+                aux_metrics["advanced/aux_loss"] = aux_loss.detach()
             loss = ce_loss + aux_loss
             train_loss += ce_loss.detach()
             train_aux_loss += aux_loss.detach()
+            advanced_runtime_scale_sum += torch.as_tensor(runtime_scale, device=device, dtype=torch.float32)
             for key, value in aux_metrics.items():
                 advanced_metric_sums[key] = advanced_metric_sums.get(key, torch.zeros((), device=device)) + value.detach()
             (loss * grad_scale).backward()
@@ -1953,11 +2011,14 @@ def main() -> None:
         train_loss /= grad_accum_steps
         train_aux_loss /= grad_accum_steps
         advanced_metric_avgs = {key: value / grad_accum_steps for key, value in advanced_metric_sums.items()}
+        advanced_runtime_scale_avg = advanced_runtime_scale_sum / grad_accum_steps
         if distributed:
             dist.all_reduce(train_token_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(train_byte_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(train_aux_loss, op=dist.ReduceOp.SUM)
             train_aux_loss /= world_size
+            dist.all_reduce(advanced_runtime_scale_avg, op=dist.ReduceOp.SUM)
+            advanced_runtime_scale_avg /= world_size
             for key in list(advanced_metric_avgs):
                 dist.all_reduce(advanced_metric_avgs[key], op=dist.ReduceOp.SUM)
                 advanced_metric_avgs[key] /= world_size
@@ -1997,6 +2058,8 @@ def main() -> None:
                 "train/loss": float(train_loss.item()),
                 "train/total_loss": float((train_loss + train_aux_loss).item()),
                 "train/advanced_aux_loss": float(train_aux_loss.item()),
+                "advanced/runtime_scale_applied": float(advanced_runtime_scale_avg.item()),
+                "advanced/backprop_enabled": float(advanced_runtime_scale_avg.item() > 0.0),
                 "train/perplexity": math.exp(min(float(train_loss.item()), 20.0)),
                 "train/bpb": train_bpb,
                 "train_bpb": train_bpb,
