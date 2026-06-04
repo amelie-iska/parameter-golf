@@ -557,6 +557,7 @@ def build_bigram_logit_bias_from_tokens(
     counts = torch.bincount(flat, minlength=vocab_size * vocab_size).reshape(vocab_size, vocab_size).to(torch.float32)
     counts.add_(float(alpha))
     log_probs = counts.log() - counts.sum(dim=1, keepdim=True).log()
+    log_probs = log_probs - log_probs.mean(dim=1, keepdim=True)
     return log_probs.mul(float(strength)).to(dtype=torch.float32)
 
 
@@ -597,6 +598,7 @@ def build_bigram_logit_bias_from_shards(
         if remaining is not None:
             remaining = max(0, remaining - read_count)
     log_probs = counts.log() - counts.sum(dim=1, keepdim=True).log()
+    log_probs = log_probs - log_probs.mean(dim=1, keepdim=True)
     bias = log_probs.mul(float(strength)).to(dtype=torch.float32)
     log0(
         "bigram_bias_init_from_data:"
@@ -661,6 +663,7 @@ def build_hash_ngram_logit_bias_from_shards(
         if remaining is not None:
             remaining = max(0, remaining - read_count)
     log_probs = counts.log() - counts.sum(dim=1, keepdim=True).log()
+    log_probs = log_probs - log_probs.mean(dim=1, keepdim=True)
     bias = log_probs.mul(float(strength)).to(dtype=torch.float32)
     log0(
         "hash_ngram_bias_init_from_data:"
