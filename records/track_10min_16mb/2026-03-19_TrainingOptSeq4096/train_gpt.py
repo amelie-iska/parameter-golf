@@ -95,6 +95,8 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     polarquant_kv_bits = int(os.environ.get("POLARQUANT_KV_BITS", 0))
     polarquant_train = os.environ.get("POLARQUANT_TRAIN", "0").lower() in {"1", "true", "yes", "on"}
+    polarquant_train_sample_tokens = int(os.environ.get("POLARQUANT_TRAIN_SAMPLE_TOKENS", 0))
+    polarquant_eval_sample_tokens = int(os.environ.get("POLARQUANT_EVAL_SAMPLE_TOKENS", 0))
     polarquant_seed = int(os.environ.get("POLARQUANT_SEED", 271828))
 
     # Optimizer hyperparameters.
@@ -968,6 +970,17 @@ def polarquant_kv_perturb(x: Tensor, signs: Tensor, bits: int) -> Tensor:
     return restored.to(dtype=original_dtype)
 
 
+def sampled_polarquant_kv_perturb(x: Tensor, signs: Tensor, bits: int, max_tokens: int) -> Tensor:
+    if max_tokens <= 0 or x.size(-2) <= max_tokens:
+        return polarquant_kv_perturb(x, signs, bits)
+    stride = max(1, math.ceil(float(x.size(-2)) / float(max_tokens)))
+    index = torch.arange(0, x.size(-2), stride, device=x.device)[:max_tokens]
+    sample = x.index_select(-2, index)
+    perturbed_sample = polarquant_kv_perturb(sample, signs, bits)
+    out = x.clone()
+    return out.index_copy(-2, index, perturbed_sample)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -978,6 +991,8 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         polarquant_kv_bits: int = 0,
         polarquant_train: bool = False,
+        polarquant_train_sample_tokens: int = 0,
+        polarquant_eval_sample_tokens: int = 0,
         polarquant_seed: int = 271828,
         layer_idx: int = 0,
     ):
@@ -991,6 +1006,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.polarquant_kv_bits = int(polarquant_kv_bits)
         self.polarquant_train = bool(polarquant_train)
+        self.polarquant_train_sample_tokens = int(polarquant_train_sample_tokens)
+        self.polarquant_eval_sample_tokens = int(polarquant_eval_sample_tokens)
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
@@ -1021,8 +1038,19 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         if self.polarquant_kv_bits > 0 and (self.polarquant_train or not self.training):
-            k = polarquant_kv_perturb(k, self.polarquant_signs.to(device=k.device), self.polarquant_kv_bits)
-            v = polarquant_kv_perturb(v, self.polarquant_signs.to(device=v.device), self.polarquant_kv_bits)
+            sample_tokens = self.polarquant_train_sample_tokens if self.training else self.polarquant_eval_sample_tokens
+            k = sampled_polarquant_kv_perturb(
+                k,
+                self.polarquant_signs.to(device=k.device),
+                self.polarquant_kv_bits,
+                sample_tokens,
+            )
+            v = sampled_polarquant_kv_perturb(
+                v,
+                self.polarquant_signs.to(device=v.device),
+                self.polarquant_kv_bits,
+                sample_tokens,
+            )
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -1061,6 +1089,8 @@ class Block(nn.Module):
         qk_gain_init: float,
         polarquant_kv_bits: int = 0,
         polarquant_train: bool = False,
+        polarquant_train_sample_tokens: int = 0,
+        polarquant_eval_sample_tokens: int = 0,
         polarquant_seed: int = 271828,
         layer_idx: int = 0,
     ):
@@ -1075,6 +1105,8 @@ class Block(nn.Module):
             qk_gain_init,
             polarquant_kv_bits=polarquant_kv_bits,
             polarquant_train=polarquant_train,
+            polarquant_train_sample_tokens=polarquant_train_sample_tokens,
+            polarquant_eval_sample_tokens=polarquant_eval_sample_tokens,
             polarquant_seed=polarquant_seed,
             layer_idx=layer_idx,
         )
@@ -1116,6 +1148,8 @@ class GPT(nn.Module):
         hash_ngram_bias_scale: float = 1.0,
         polarquant_kv_bits: int = 0,
         polarquant_train: bool = False,
+        polarquant_train_sample_tokens: int = 0,
+        polarquant_eval_sample_tokens: int = 0,
         polarquant_seed: int = 271828,
     ):
         super().__init__()
@@ -1135,6 +1169,8 @@ class GPT(nn.Module):
         self.hash_ngram_bias_scale = hash_ngram_bias_scale
         self.polarquant_kv_bits = int(polarquant_kv_bits)
         self.polarquant_train = bool(polarquant_train)
+        self.polarquant_train_sample_tokens = int(polarquant_train_sample_tokens)
+        self.polarquant_eval_sample_tokens = int(polarquant_eval_sample_tokens)
         self.polarquant_seed = int(polarquant_seed)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.prev_token_bias = nn.Embedding(vocab_size, vocab_size) if bigram_bias else None
@@ -1154,6 +1190,8 @@ class GPT(nn.Module):
                     qk_gain_init,
                     polarquant_kv_bits=self.polarquant_kv_bits,
                     polarquant_train=self.polarquant_train,
+                    polarquant_train_sample_tokens=self.polarquant_train_sample_tokens,
+                    polarquant_eval_sample_tokens=self.polarquant_eval_sample_tokens,
                     polarquant_seed=self.polarquant_seed,
                     layer_idx=i,
                 )
@@ -1345,6 +1383,8 @@ def main() -> None:
         hash_ngram_bias_scale=args.hash_ngram_bias_scale,
         polarquant_kv_bits=args.polarquant_kv_bits,
         polarquant_train=args.polarquant_train,
+        polarquant_train_sample_tokens=args.polarquant_train_sample_tokens,
+        polarquant_eval_sample_tokens=args.polarquant_eval_sample_tokens,
         polarquant_seed=args.polarquant_seed,
     )
     if args.bigram_bias and args.bigram_bias_init_from_data and not args.resume_checkpoint:
@@ -1431,7 +1471,8 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"polarquant_kv:bits:{args.polarquant_kv_bits} train:{int(args.polarquant_train)} "
-        f"seed:{args.polarquant_seed}"
+        f"train_sample_tokens:{args.polarquant_train_sample_tokens} "
+        f"eval_sample_tokens:{args.polarquant_eval_sample_tokens} seed:{args.polarquant_seed}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
