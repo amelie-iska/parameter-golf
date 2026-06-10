@@ -27,6 +27,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from tropicalgt_tokengt_adapter import TokenGTAdapterConfig, TokenGTGraphAdapter
+except Exception:
+    TokenGTAdapterConfig = None
+    TokenGTGraphAdapter = None
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -69,6 +75,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    tropicalgt_graph_adapter = bool(int(os.environ.get("TROPICALGT_GRAPH_ADAPTER", "0")))
+    tropicalgt_graph_feature_dim = int(os.environ.get("TROPICALGT_GRAPH_FEATURE_DIM", 48))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -659,6 +667,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_graph_adapter: bool = False,
+        graph_feature_dim: int = 48,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -667,6 +677,13 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.graph_adapter = None
+        if use_graph_adapter:
+            if TokenGTAdapterConfig is None or TokenGTGraphAdapter is None:
+                raise RuntimeError("TROPICALGT_GRAPH_ADAPTER=1 requires tropicalgt_tokengt_adapter.py")
+            self.graph_adapter = TokenGTGraphAdapter(
+                TokenGTAdapterConfig(graph_feature_dim=graph_feature_dim, model_dim=model_dim)
+            )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -697,8 +714,14 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, graph_tokens: tuple[Tensor, Tensor, Tensor] | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
+        if graph_tokens is not None:
+            if self.graph_adapter is None:
+                raise ValueError("graph_tokens were provided but the TropicalGT graph adapter is disabled")
+            token_features, token_type_ids, graph_mask = graph_tokens
+            graph_context = self.graph_adapter(token_features, token_type_ids, graph_mask).to(dtype=x.dtype)
+            x = x + graph_context[:, None, :]
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -835,6 +858,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_graph_adapter=args.tropicalgt_graph_adapter,
+        graph_feature_dim=args.tropicalgt_graph_feature_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -861,6 +886,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.graph_adapter is not None:
+        scalar_params.extend(base_model.graph_adapter.parameters())
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -897,6 +924,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"tropicalgt_graph_adapter:{args.tropicalgt_graph_adapter} "
+        f"graph_feature_dim:{args.tropicalgt_graph_feature_dim}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
