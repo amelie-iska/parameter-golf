@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+from collections.abc import Mapping
 from pathlib import Path
 import sys
 import zipfile
@@ -49,11 +50,7 @@ def main() -> None:
         artifact_path.write_bytes(args.model_artifact.read_bytes())
     elif args.checkpoint:
         state = torch.load(args.checkpoint, map_location="cpu")
-        if isinstance(state, dict) and "model_state_dict" in state:
-            state = state["model_state_dict"]
-        if not isinstance(state, dict):
-            raise TypeError("checkpoint must be a state_dict or contain model_state_dict")
-        artifact_path.write_bytes(_quantized_blob(state))
+        artifact_path.write_bytes(_quantized_blob(_extract_tensor_state_dict(state)))
     elif args.smoke_dummy:
         artifact_path.write_bytes(_quantized_blob(_dummy_state_dict()))
     else:
@@ -113,6 +110,28 @@ def _quantized_blob(state_dict: dict[str, torch.Tensor]) -> bytes:
     buf = io.BytesIO()
     torch.save(quant_obj, buf)
     return zlib.compress(buf.getvalue(), level=9)
+
+
+def _extract_tensor_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
+    if _is_tensor_state_dict(checkpoint):
+        return dict(checkpoint)
+    if isinstance(checkpoint, Mapping):
+        for key in ("model_state_dict", "state_dict", "model", "module"):
+            if key in checkpoint:
+                nested = checkpoint[key]
+                if _is_tensor_state_dict(nested):
+                    return dict(nested)
+        tensor_like = {str(k): v for k, v in checkpoint.items() if torch.is_tensor(v)}
+        if tensor_like and len(tensor_like) == len(checkpoint):
+            return tensor_like
+    raise TypeError(
+        "checkpoint must be a tensor state_dict or contain one under "
+        "'model_state_dict', 'state_dict', 'model', or 'module'"
+    )
+
+
+def _is_tensor_state_dict(value: object) -> bool:
+    return isinstance(value, Mapping) and bool(value) and all(torch.is_tensor(tensor) for tensor in value.values())
 
 
 def _dummy_state_dict() -> dict[str, torch.Tensor]:
