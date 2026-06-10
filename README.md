@@ -7,6 +7,20 @@
 
 This challenge is heavily inspired by the [NanoGPT Speedrunning](https://github.com/KellerJordan/modded-nanogpt) challenge, where participants compete to train a model that reaches 3.28 FineWeb validation loss as quickly as possible. We're excited to see how optimizing for a parameter-constrained setting pushes people toward unique architectures (test-time compute, aggressive parameter tying, depth recurrence, low-rank training, ...), compression schemes (low precision, QAT, bitnets, novel tokenizers, ...), and other creative submissions (test-time training, long context, megakernels ...). 
 
+## TropicalGT Stripped Export
+
+The `tropicalgt-i-tokenization` branch keeps the competition path separate from the full TropicalGT-I research stack. `train_gpt.py` can optionally enable TokenGT-style graph conditioning with `TROPICALGT_GRAPH_ADAPTER=1`; the graph adapter accepts both `(token_features, token_type_ids, mask)` and `(token_features, token_type_ids, endpoint_ids, mask)` tuples, where endpoint ids encode TokenGT incidence and `-1` is padding.
+
+For a Parameter-Golf-sized package, run:
+
+```bash
+python scripts/export_tropicalgt_parameter_golf.py \
+  --model-artifact final_model.int8.ptz \
+  --output-dir parameter_golf_export
+```
+
+The resulting zip contains only `train_gpt.py`, `tropicalgt_tokengt_adapter.py`, `final_model.int8.ptz`, and `manifest.json`. The manifest reports artifact bytes, code bytes, the 16,000,000 byte cap check, the primary BPB metric, and the graph-aware BPB contract. It intentionally excludes TropicalGT-I training code, topological algebra audits, W&B runs, visualizations, datasets, and non-final checkpoints.
+
 If you're familiar with [neural scaling laws](https://arxiv.org/abs/2001.08361), you can consider this challenge a form of L(N) optimization, where the objective is to optimize the lowest loss given a fixed number of parameters (N) unconstrained by data, compute, steps, or architecture. Challenges like the [NanoGPT Speedrun](https://github.com/KellerJordan/modded-nanogpt), which optimizes for a form of L(T) (~lowest time given constrained loss) or the [NanoGPT Slowrun](https://github.com/qlabs-eng/slowrun), which optimizes for L(D) (lowest loss given constrained dataset size), can be thought of as equivalent challenges in this family.
 
 Ideally, we'd allow for submissions to use arbitrary computational resources. But in order to make the challenge not inaccessibly expensive, we're limiting *leaderboard submissions* to 10 minutes on 8xH100s. However, we'd still love to see submissions that don't meet the compute limitation requirements in our 'Non-record Submissions' section: We're excited to see people push the infinite frontier of parameter limited performance as well.

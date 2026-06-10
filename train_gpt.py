@@ -714,13 +714,19 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, graph_tokens: tuple[Tensor, Tensor, Tensor] | None = None) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, graph_tokens: tuple[Tensor, ...] | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         if graph_tokens is not None:
             if self.graph_adapter is None:
                 raise ValueError("graph_tokens were provided but the TropicalGT graph adapter is disabled")
-            token_features, token_type_ids, graph_mask = graph_tokens
-            graph_context = self.graph_adapter(token_features, token_type_ids, graph_mask).to(dtype=x.dtype)
+            if len(graph_tokens) == 3:
+                token_features, token_type_ids, graph_mask = graph_tokens
+                endpoint_ids = None
+            elif len(graph_tokens) == 4:
+                token_features, token_type_ids, endpoint_ids, graph_mask = graph_tokens
+            else:
+                raise ValueError("graph_tokens must be (features,type_ids,mask) or (features,type_ids,endpoint_ids,mask)")
+            graph_context = self.graph_adapter(token_features, token_type_ids, graph_mask, endpoint_ids=endpoint_ids).to(dtype=x.dtype)
             x = x + graph_context[:, None, :]
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x

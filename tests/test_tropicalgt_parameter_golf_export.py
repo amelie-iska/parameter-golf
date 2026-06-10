@@ -1,0 +1,37 @@
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class TropicalGTParameterGolfExportTest(unittest.TestCase):
+    def test_smoke_export_is_stripped_and_within_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = [
+                sys.executable,
+                str(ROOT / "scripts" / "export_tropicalgt_parameter_golf.py"),
+                "--smoke-dummy",
+                "--output-dir",
+                tmp,
+            ]
+            subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True, text=True)
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["within_cap"])
+            self.assertEqual(
+                set(manifest["included_files"]),
+                {"train_gpt.py", "tropicalgt_tokengt_adapter.py", "final_model.int8.ptz", "manifest.json"},
+            )
+            self.assertIn("(token_features, token_type_ids, endpoint_ids, mask)", manifest["graph_conditioning_contract"]["tuple_forms"])
+            self.assertEqual(manifest["metric_contract"]["graph_primary"].split()[0], "graph_bpb")
+            with zipfile.ZipFile(Path(tmp) / "tropicalgt_parameter_golf_submission.zip") as zf:
+                self.assertEqual(set(zf.namelist()), set(manifest["included_files"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
