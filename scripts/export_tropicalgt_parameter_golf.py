@@ -32,6 +32,7 @@ from train_gpt import quantize_state_dict_int8  # noqa: E402
 
 CAP_BYTES = 16_000_000
 CODE_FILES = ("train_gpt.py", "tropicalgt_tokengt_adapter.py")
+COMPETITION_EXCLUDED_PREFIXES = ("gfn.", "graphcg.", "memory.")
 
 
 def main() -> None:
@@ -67,6 +68,11 @@ def main() -> None:
         "total_competition_bytes": int(artifact_bytes + code_bytes),
         "within_cap": bool(artifact_bytes + code_bytes <= args.cap_bytes),
         "included_files": [*CODE_FILES, artifact_path.name, "manifest.json"],
+        "state_dict_filter": {
+            "kept_for_competition": "LM core, graph-token adapter, tropical attention, GRU transition, and output head",
+            "excluded_training_only_prefixes": list(COMPETITION_EXCLUDED_PREFIXES),
+            "reason": "GFlowNet, GraphCG direction bank, and analogical memory heads are training/audit modules; stripping them preserves BPB inference while keeping the research checkpoint full.",
+        },
         "excluded_by_design": [
             "TropicalGT-I research training package",
             "topological algebra audit artifacts",
@@ -106,10 +112,22 @@ def main() -> None:
 
 
 def _quantized_blob(state_dict: dict[str, torch.Tensor]) -> bytes:
-    quant_obj, _stats = quantize_state_dict_int8(state_dict)
+    competition_state, _stripped = _competition_state_dict(state_dict)
+    quant_obj, _stats = quantize_state_dict_int8(competition_state)
     buf = io.BytesIO()
     torch.save(quant_obj, buf)
     return zlib.compress(buf.getvalue(), level=9)
+
+
+def _competition_state_dict(state_dict: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    kept: dict[str, torch.Tensor] = {}
+    stripped: dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        if key.startswith(COMPETITION_EXCLUDED_PREFIXES):
+            stripped[key] = tensor
+        else:
+            kept[key] = tensor
+    return kept, stripped
 
 
 def _extract_tensor_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
