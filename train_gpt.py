@@ -104,6 +104,10 @@ class Hyperparameters:
     graph_output_edge_token_weight = float(os.environ.get("GRAPH_OUTPUT_EDGE_TOKEN_WEIGHT", 0.035))
     graph_output_score_correction = bool(int(os.environ.get("GRAPH_OUTPUT_SCORE_CORRECTION", "1")))
     graph_output_score_correction_weight = float(os.environ.get("GRAPH_OUTPUT_SCORE_CORRECTION_WEIGHT", 0.024))
+    graph_output_calibration_loss_weight = float(os.environ.get("GRAPH_OUTPUT_CALIBRATION_LOSS_WEIGHT", 0.0))
+    graph_output_calibration_margin = float(os.environ.get("GRAPH_OUTPUT_CALIBRATION_MARGIN", 0.0))
+    graph_output_calibration_every = int(os.environ.get("GRAPH_OUTPUT_CALIBRATION_EVERY", 25))
+    graph_output_calibration_max_sequences = int(os.environ.get("GRAPH_OUTPUT_CALIBRATION_MAX_SEQUENCES", 2))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -165,6 +169,9 @@ class Hyperparameters:
     sidecar_every = int(os.environ.get("TORICGT_SIDECAR_EVERY", 1))
     sidecar_lr = float(os.environ.get("TORICGT_SIDECAR_LR", 2e-4))
     sidecar_loss_weight = float(os.environ.get("TORICGT_SIDECAR_LOSS_WEIGHT", 1.0))
+    sidecar_loss_weight_start = float(os.environ.get("TORICGT_SIDECAR_LOSS_WEIGHT_START", min(0.05, sidecar_loss_weight)))
+    sidecar_warmup_steps = int(os.environ.get("TORICGT_SIDECAR_WARMUP_STEPS", 500))
+    sidecar_hold_steps = int(os.environ.get("TORICGT_SIDECAR_HOLD_STEPS", 100))
     graphcg_loss_weight = float(os.environ.get("GRAPHCG_LOSS_WEIGHT", 2e-5))
     analogy_loss_weight = float(os.environ.get("ANALOGY_LOSS_WEIGHT", 2e-5))
     tokengt_graph_loss_weight = float(os.environ.get("TOKENGT_GRAPH_LOSS_WEIGHT", 4e-5))
@@ -1256,6 +1263,45 @@ class GPT(nn.Module):
         loss, per_token_nll = self._loss_from_hidden(hidden, target_ids)
         return loss, hidden, per_token_nll
 
+    def graph_output_flattening_calibration(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        *,
+        margin: float = 0.0,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Train graph-output flattening only when it worsens FineWeb CE.
+
+        The raw graph hidden state is detached before the flattening adapter, so
+        the calibration pressure is concentrated on the OAI-FineWeb-only
+        flattening/score-correction path instead of pulling the main backbone
+        away from the score-defining BPB objective.
+        """
+
+        if self.graph_output_flattening is None:
+            zero = input_ids.new_zeros((), dtype=torch.float32)
+            return zero, {
+                "graph_output_flattening_calibration_loss": zero,
+                "graph_output_flattening_raw_ce": zero,
+                "graph_output_flattening_flat_ce": zero,
+                "graph_output_flattening_ce_lift": zero,
+                "graph_output_flattening_ce_regression": zero,
+            }
+        with torch.no_grad():
+            raw_hidden = self._hidden(input_ids, flatten_graph_output=False)
+            raw_loss, _ = self._loss_from_hidden(raw_hidden, target_ids)
+        flat_hidden = self.graph_output_flattening(raw_hidden.detach())
+        flat_loss, _ = self._loss_from_hidden(flat_hidden, target_ids)
+        regression = torch.relu(flat_loss.float() - raw_loss.detach().float() + float(margin))
+        lift = raw_loss.detach().float() - flat_loss.detach().float()
+        return regression, {
+            "graph_output_flattening_calibration_loss": regression.detach().float(),
+            "graph_output_flattening_raw_ce": raw_loss.detach().float(),
+            "graph_output_flattening_flat_ce": flat_loss.detach().float(),
+            "graph_output_flattening_ce_lift": lift,
+            "graph_output_flattening_ce_regression": regression.detach().float(),
+        }
+
 
 # -----------------------------
 # TRAINING
@@ -1652,7 +1698,10 @@ def main() -> None:
         f"score_correction={args.graph_output_score_correction_weight} "
         f"virtual_edge_tokens:{int(args.graph_output_virtual_edge_tokens)} "
         f"score_correction_enabled:{int(args.graph_output_score_correction)} "
-        f"lr:{args.graph_output_flattening_lr} flatten_order=sentencepiece_sequence scope=oai_fineweb_bpb_only"
+        f"lr:{args.graph_output_flattening_lr} "
+        f"calibration_weight:{args.graph_output_calibration_loss_weight} "
+        f"calibration_every:{args.graph_output_calibration_every} "
+        f"flatten_order=sentencepiece_sequence scope=oai_fineweb_bpb_only"
     )
     log0(
         "graph_lm_primary:"
@@ -1952,11 +2001,14 @@ def main() -> None:
         teacher_metrics: dict[str, float] = {}
         aux_grad_metrics: dict[str, float] = {}
         last_fineweb_x: Tensor | None = None
+        last_fineweb_y: Tensor | None = None
+        flattening_calibration_metrics: dict[str, float] = {}
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             last_fineweb_x = x
+            last_fineweb_y = y
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             batch_token_count = float(y.numel())
@@ -1979,6 +2031,50 @@ def main() -> None:
         train_tokens_per_byte = float((train_token_count / train_byte_count.clamp_min(1.0)).detach().float().item())
         train_bpb = float(train_bits_per_token * train_tokens_per_byte)
         primary_grads = snapshot_base_grads() if args.aux_grad_routing else None
+
+        if (
+            args.graph_output_calibration_loss_weight > 0.0
+            and last_fineweb_x is not None
+            and last_fineweb_y is not None
+            and args.graph_output_calibration_every > 0
+            and step % args.graph_output_calibration_every == 0
+        ):
+            seq_count = min(
+                max(1, int(args.graph_output_calibration_max_sequences)),
+                int(last_fineweb_x.shape[0]),
+            )
+            cx = last_fineweb_x[:seq_count]
+            cy = last_fineweb_y[:seq_count]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                calibration_loss, calibration_out = base_model.graph_output_flattening_calibration(
+                    cx,
+                    cy,
+                    margin=float(args.graph_output_calibration_margin),
+                )
+                weighted_calibration_loss = float(args.graph_output_calibration_loss_weight) * calibration_loss
+            if float(weighted_calibration_loss.detach().float().item()) > 0.0:
+                weighted_calibration_loss.backward()
+            flattening_calibration_metrics = {
+                "graph_output_flattening/calibration_loss": float(calibration_loss.detach().float().item()),
+                "graph_output_flattening/calibration_weighted_loss": float(
+                    weighted_calibration_loss.detach().float().item()
+                ),
+                "graph_output_flattening/calibration_raw_ce": float(
+                    calibration_out["graph_output_flattening_raw_ce"].detach().float().item()
+                ),
+                "graph_output_flattening/calibration_flat_ce": float(
+                    calibration_out["graph_output_flattening_flat_ce"].detach().float().item()
+                ),
+                "graph_output_flattening/ce_lift": float(
+                    calibration_out["graph_output_flattening_ce_lift"].detach().float().item()
+                ),
+                "graph_output_flattening/ce_regression": float(
+                    calibration_out["graph_output_flattening_ce_regression"].detach().float().item()
+                ),
+                "graph_output_flattening/calibration_margin": float(args.graph_output_calibration_margin),
+                "graph_output_flattening/calibration_weight": float(args.graph_output_calibration_loss_weight),
+                "graph_output_flattening/calibration_sequences": float(seq_count),
+            }
 
         current_teacher_weight = teacher_weight(step)
         if teacher_model is not None and current_teacher_weight > 0.0 and last_fineweb_x is not None:
@@ -2073,11 +2169,18 @@ def main() -> None:
         if sidecar is not None and graph_loader is not None and args.sidecar_every > 0 and step % args.sidecar_every == 0:
             sidecar.train()
             sx, sy = graph_loader.next_batch(device)
+            scheduled_sidecar_weight = linear_schedule(
+                step,
+                args.sidecar_loss_weight_start,
+                args.sidecar_loss_weight,
+                args.sidecar_warmup_steps,
+                args.sidecar_hold_steps,
+            )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 sidecar_lm_loss, sidecar_hidden, sidecar_nll = base_model.forward_aux(sx, sy)
                 positions = torch.arange(sx.shape[1], device=device, dtype=torch.float32).unsqueeze(0).expand(sx.shape[0], -1)
                 sidecar_out = sidecar(sidecar_hidden, sy, positions, sidecar_nll)
-                sidecar_loss = float(args.sidecar_loss_weight) * sidecar_out["toricgt_sidecar_loss"]
+                sidecar_loss = float(scheduled_sidecar_weight) * sidecar_out["toricgt_sidecar_loss"]
             if args.aux_grad_routing and args.aux_grad_route_sidecar:
                 saved_base_grads = snapshot_base_grads()
                 zero_base_grads()
@@ -2092,6 +2195,11 @@ def main() -> None:
             sidecar_metrics = {
                 "toricgt_sidecar/lm_loss": float(sidecar_lm_loss.detach().float().item()),
                 "toricgt_sidecar/loss": float(sidecar_loss.detach().float().item()),
+                "toricgt_sidecar/loss_weight": float(scheduled_sidecar_weight),
+                "toricgt_sidecar/loss_weight_peak": float(args.sidecar_loss_weight),
+                "toricgt_sidecar/loss_weight_start": float(args.sidecar_loss_weight_start),
+                "toricgt_sidecar/warmup_steps": float(args.sidecar_warmup_steps),
+                "toricgt_sidecar/hold_steps": float(args.sidecar_hold_steps),
             }
             for name, value in sidecar_out.items():
                 if torch.is_tensor(value) and value.ndim == 0:
@@ -2201,12 +2309,20 @@ def main() -> None:
                 "graph_output_flattening/score_correction_weight": float(args.graph_output_score_correction_weight),
                 "graph_output_flattening/lr": float(args.graph_output_flattening_lr),
                 "graph_output_flattening/oai_fineweb_bpb_only": 1.0,
+                "graph_output_flattening/calibration_enabled": float(
+                    args.graph_output_calibration_loss_weight > 0.0
+                    and base_model.graph_output_flattening is not None
+                ),
+                "graph_output_flattening/calibration_every": float(args.graph_output_calibration_every),
                 "graph_lm_primary/enabled": float(graph_lm_loader is not None),
                 "graph_lm_primary/required": float(args.require_graph_lm_primary),
                 "graph_lm_primary/every": float(args.graph_lm_every),
                 "graph_lm_primary/loss_weight_peak_config": float(args.graph_lm_loss_weight),
                 "graph_lm_primary/loss_weight_start_config": float(args.graph_lm_loss_weight_start),
                 "toricgt_sidecar/enabled": float(sidecar is not None),
+                "toricgt_sidecar/loss_weight_peak_config": float(args.sidecar_loss_weight),
+                "toricgt_sidecar/loss_weight_start_config": float(args.sidecar_loss_weight_start),
+                "toricgt_sidecar/loss_warmup_steps_config": float(args.sidecar_warmup_steps),
                 "toricgt_sidecar/graphcg_active": float(sidecar is not None),
                 "toricgt_sidecar/analogy_active": float(sidecar is not None),
                 "toricgt_sidecar/memory_retrieval_active": float(sidecar is not None),
@@ -2222,6 +2338,7 @@ def main() -> None:
                 "aux_grad_routing/enabled": float(args.aux_grad_routing),
                 "score_first_tta/enabled": float(args.score_first_tta),
             }
+            payload.update(flattening_calibration_metrics)
             payload.update(graph_lm_metrics)
             payload.update(teacher_metrics)
             payload.update(sidecar_metrics)
