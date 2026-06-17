@@ -164,6 +164,23 @@ class Hyperparameters:
     score_first_tta = bool(int(os.environ.get("SCORE_FIRST_TTA", "0")))
     score_first_tta_steps = int(os.environ.get("SCORE_FIRST_TTA_STEPS", 0))
     score_first_tta_lr = float(os.environ.get("SCORE_FIRST_TTA_LR", 0.0))
+    score_first_tta_commit = bool(int(os.environ.get("SCORE_FIRST_TTA_COMMIT", "0")))
+    oai_gflownet = bool(int(os.environ.get("OAI_GFLOWNET", "0")))
+    oai_gflownet_lr = float(os.environ.get("OAI_GFLOWNET_LR", 2e-4))
+    oai_gflownet_every = int(os.environ.get("OAI_GFLOWNET_EVERY", 1))
+    oai_gflownet_loss_weight = float(os.environ.get("OAI_GFLOWNET_LOSS_WEIGHT", 0.0))
+    oai_gflownet_entropy_weight = float(os.environ.get("OAI_GFLOWNET_ENTROPY_WEIGHT", 0.0))
+    oai_gflownet_entropy_target = float(os.environ.get("OAI_GFLOWNET_ENTROPY_TARGET", 1.8))
+    oai_gflownet_num_actions = int(os.environ.get("OAI_GFLOWNET_NUM_ACTIONS", 16))
+    oai_gflownet_hidden_dim = int(os.environ.get("OAI_GFLOWNET_HIDDEN_DIM", 192))
+    oai_gflownet_max_sequences = int(os.environ.get("OAI_GFLOWNET_MAX_SEQUENCES", 2))
+    oai_gflownet_max_positions = int(os.environ.get("OAI_GFLOWNET_MAX_POSITIONS", 192))
+    oai_mtp = bool(int(os.environ.get("OAI_MTP", "0")))
+    oai_mtp_lr = float(os.environ.get("OAI_MTP_LR", tokengt_first_class_lr))
+    oai_mtp_every = int(os.environ.get("OAI_MTP_EVERY", 1))
+    oai_mtp_loss_weight = float(os.environ.get("OAI_MTP_LOSS_WEIGHT", 0.0))
+    oai_mtp_offsets = os.environ.get("OAI_MTP_OFFSETS", "2")
+    oai_mtp_max_sequences = int(os.environ.get("OAI_MTP_MAX_SEQUENCES", 2))
     sidecar_seq_len = int(os.environ.get("TORICGT_SIDECAR_SEQ_LEN", min(256, train_seq_len)))
     sidecar_batch_size = int(os.environ.get("TORICGT_SIDECAR_BATCH_SIZE", 8))
     sidecar_every = int(os.environ.get("TORICGT_SIDECAR_EVERY", 1))
@@ -426,6 +443,7 @@ def eval_val(
     model.eval()
     tta_optimizer = None
     tta_restore: list[tuple[nn.Parameter, bool]] = []
+    tta_param_data_restore: list[tuple[nn.Parameter, Tensor]] = []
     tta_steps_done = 0
     if args.score_first_tta:
         eval_module = model.module if hasattr(model, "module") else model
@@ -440,6 +458,8 @@ def eval_val(
             for param in eval_base.parameters():
                 tta_restore.append((param, bool(param.requires_grad)))
                 param.requires_grad_(id(param) in tta_param_ids)
+            if not args.score_first_tta_commit:
+                tta_param_data_restore = [(param, param.detach().clone()) for param in tta_params]
             tta_optimizer = torch.optim.AdamW(tta_params, lr=max(float(args.score_first_tta_lr), 1e-8))
     try:
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
@@ -469,6 +489,8 @@ def eval_val(
                 tta_optimizer.zero_grad(set_to_none=True)
                 tta_steps_done += 1
     finally:
+        for param, value in tta_param_data_restore:
+            param.data.copy_(value.to(device=param.device, dtype=param.dtype))
         for param, requires_grad in tta_restore:
             param.requires_grad_(requires_grad)
 
@@ -1071,6 +1093,85 @@ class GraphOutputFlatteningAdapter(nn.Module):
         return graph_hidden + gate * update
 
 
+class OAIEmbeddingGFlowNetHead(nn.Module):
+    """Training-only embedding-space GFlowNet head for the OAI baseline.
+
+    Hidden states are treated as a graph-of-thought trajectory.  Token buckets are
+    lightweight discrete refinement actions, and mean negative log likelihood
+    supplies the terminal reward.  The head is intentionally not serialized in the
+    final Parameter-Golf artifact unless a later export path explicitly keeps it.
+    """
+
+    def __init__(self, dim: int, *, num_actions: int, hidden_dim: int) -> None:
+        super().__init__()
+        if num_actions < 2:
+            raise ValueError("OAI_GFLOWNET_NUM_ACTIONS must be at least 2")
+        self.num_actions = int(num_actions)
+        self.forward_policy = nn.Sequential(
+            RMSNorm(),
+            CastedLinear(dim, hidden_dim),
+            nn.GELU(),
+            CastedLinear(hidden_dim, self.num_actions),
+        )
+        self.backward_policy = nn.Sequential(
+            RMSNorm(),
+            CastedLinear(dim, hidden_dim),
+            nn.GELU(),
+            CastedLinear(hidden_dim, self.num_actions),
+        )
+        self.log_z = nn.Parameter(torch.zeros((), dtype=torch.float32))
+
+    def forward(
+        self,
+        hidden: Tensor,
+        target_ids: Tensor,
+        per_token_nll: Tensor,
+        *,
+        max_positions: int,
+    ) -> dict[str, Tensor]:
+        zero = hidden.new_zeros(())
+        max_positions = max(2, min(int(max_positions), int(hidden.shape[1])))
+        if hidden.shape[0] < 1 or max_positions < 2:
+            return {
+                "oai_gflownet_loss": zero,
+                "oai_gflownet_tb_residual": zero,
+                "oai_gflownet_entropy": zero,
+                "oai_gflownet_entropy_objective": zero,
+                "oai_gflownet_action_diversity": zero,
+                "oai_gflownet_reward_mean": zero,
+                "oai_gflownet_score_gap": zero,
+                "oai_gflownet_log_z": self.log_z.detach().to(device=hidden.device, dtype=hidden.dtype),
+            }
+        h = hidden[:, :max_positions, :]
+        targets = target_ids[:, :max_positions].to(torch.long)
+        nll = per_token_nll[:, :max_positions].detach().float()
+        f_logits = self.forward_policy(h[:, :-1, :]).float().clamp(-30.0, 30.0)
+        b_logits = self.backward_policy(h[:, 1:, :]).float().clamp(-30.0, 30.0)
+        actions = torch.remainder(targets[:, 1:], self.num_actions)
+        log_pf = F.log_softmax(f_logits, dim=-1).gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+        log_pb = F.log_softmax(b_logits, dim=-1).gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+        reward = torch.exp(-nll.mean(dim=1)).clamp_min(1e-8)
+        residual = self.log_z.float() + (log_pf - log_pb).mean(dim=1) - reward.log()
+        tb_loss = residual.square().mean()
+        probs = torch.softmax(f_logits, dim=-1)
+        log_probs = torch.log_softmax(f_logits, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1).mean() / math.log(self.num_actions)
+        action_mass = probs.mean(dim=(0, 1)).clamp_min(1e-8)
+        diversity = -(action_mass * action_mass.log()).sum() / math.log(self.num_actions)
+        top2 = torch.topk(f_logits, k=min(2, self.num_actions), dim=-1).values
+        score_gap = (top2[..., 0] - top2[..., -1]).mean() if top2.shape[-1] > 1 else zero.float()
+        return {
+            "oai_gflownet_loss": tb_loss,
+            "oai_gflownet_tb_residual": residual.detach().abs().mean(),
+            "oai_gflownet_entropy": entropy,
+            "oai_gflownet_entropy_objective": (entropy - 1.0).square(),
+            "oai_gflownet_action_diversity": diversity.detach(),
+            "oai_gflownet_reward_mean": reward.detach().mean(),
+            "oai_gflownet_score_gap": score_gap.detach(),
+            "oai_gflownet_log_z": self.log_z.detach(),
+        }
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -1477,6 +1578,7 @@ def main() -> None:
     sidecar = None
     graph_loader = None
     graph_lm_loader = None
+    oai_gflownet_head = None
     if args.graph_lm_primary:
         if args.graph_lm_batch_size < 1:
             raise ValueError("GRAPH_LM_BATCH_SIZE must be at least 1")
@@ -1508,6 +1610,12 @@ def main() -> None:
             log0("toricgt_sidecar:init_failed_nonfatal enabled=0")
             sidecar = None
             graph_loader = None
+    if args.oai_gflownet:
+        oai_gflownet_head = OAIEmbeddingGFlowNetHead(
+            args.model_dim,
+            num_actions=args.oai_gflownet_num_actions,
+            hidden_dim=args.oai_gflownet_hidden_dim,
+        ).to(device)
     if args.require_toricgt_sidecar and sidecar is None:
         raise RuntimeError("REQUIRE_TORICGT_SIDECAR=1 but the ToricGT sidecar is disabled")
     if args.require_graph_lm_primary and graph_lm_loader is None:
@@ -1519,6 +1627,8 @@ def main() -> None:
             base_model.load_state_dict(checkpoint["model"], strict=True)
             if sidecar is not None and checkpoint.get("sidecar") is not None:
                 sidecar.load_state_dict(checkpoint["sidecar"], strict=True)
+            if oai_gflownet_head is not None and checkpoint.get("oai_gflownet") is not None:
+                oai_gflownet_head.load_state_dict(checkpoint["oai_gflownet"], strict=True)
             if args.start_step <= 0:
                 args.start_step = int(checkpoint.get("step", 0))
         else:
@@ -1673,11 +1783,26 @@ def main() -> None:
             fused=True,
         )
         optimizers.append(optimizer_sidecar)
+    if oai_gflownet_head is not None:
+        optimizer_oai_gflownet = torch.optim.AdamW(
+            [
+                {
+                    "params": list(oai_gflownet_head.parameters()),
+                    "lr": args.oai_gflownet_lr,
+                    "base_lr": args.oai_gflownet_lr,
+                }
+            ],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_oai_gflownet)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     first_class_tokengt_param_count = sum(p.numel() for p in first_class_tokengt_params)
     graph_output_flattening_param_count = sum(p.numel() for p in graph_output_flattening_params)
     sidecar_params = sum(p.numel() for p in sidecar.parameters()) if sidecar is not None else 0
+    oai_gflownet_params = sum(p.numel() for p in oai_gflownet_head.parameters()) if oai_gflownet_head is not None else 0
     log0(f"model_params:{n_params}")
     log0(
         "fineweb_graphification:"
@@ -1731,7 +1856,18 @@ def main() -> None:
         f"retrieval_conditioned_aux:{int(args.retrieval_conditioned_aux)} "
         f"uncertainty_weighting:{int(args.sidecar_uncertainty_weighting)} "
         f"graphcg_bpb_orthogonal_weight:{args.graphcg_bpb_orthogonal_weight} "
-        f"score_first_tta:{int(args.score_first_tta)}"
+        f"score_first_tta:{int(args.score_first_tta)} "
+        f"score_first_tta_commit:{int(args.score_first_tta_commit)}"
+    )
+    log0(
+        "oai_transfer_heads:"
+        f"gflownet_enabled:{int(oai_gflownet_head is not None)} "
+        f"gflownet_params:{oai_gflownet_params} "
+        f"gflownet_weight:{args.oai_gflownet_loss_weight} "
+        f"gflownet_entropy_weight:{args.oai_gflownet_entropy_weight} "
+        f"gflownet_actions:{args.oai_gflownet_num_actions} "
+        f"mtp_enabled:{int(args.oai_mtp)} mtp_weight:{args.oai_mtp_loss_weight} "
+        f"mtp_offsets:{args.oai_mtp_offsets}"
     )
     log0(
         "toricgt_sidecar_heads:"
@@ -1883,6 +2019,22 @@ def main() -> None:
         frac = min(max(step_value / max(args.teacher_distill_decay_steps, 1), 0.0), 1.0)
         return start + frac * (peak - start)
 
+    def parsed_mtp_offsets() -> list[int]:
+        offsets: list[int] = []
+        for raw in str(args.oai_mtp_offsets).replace(";", ",").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                continue
+            if value >= 2:
+                offsets.append(value)
+        return sorted(set(offsets))
+
+    mtp_offsets = parsed_mtp_offsets()
+
     def save_checkpoint(step_value: int, val_loss_value: float | None = None, val_bpb_value: float | None = None) -> None:
         if not master_process or args.checkpoint_every <= 0:
             return
@@ -1892,7 +2044,9 @@ def main() -> None:
             "step": int(step_value),
             "model": base_model.state_dict(),
             "sidecar": sidecar.state_dict() if sidecar is not None else None,
+            "oai_gflownet": oai_gflownet_head.state_dict() if oai_gflownet_head is not None else None,
             "toricgt_sidecar_enabled": bool(sidecar is not None),
+            "oai_gflownet_enabled": bool(oai_gflownet_head is not None),
             "graph_lm_primary_enabled": bool(graph_lm_loader is not None),
             "graph_output_flattening_enabled": bool(base_model.graph_output_flattening is not None),
             "val_loss": val_loss_value,
@@ -1975,6 +2129,10 @@ def main() -> None:
                     "oai_competition/bpb": float(val_bpb),
                     "bpb/oai_competition": float(val_bpb),
                     "00_primary/val_bpb": float(val_bpb),
+                    "score_first_tta/eval_enabled": float(args.score_first_tta),
+                    "score_first_tta/eval_steps": float(args.score_first_tta_steps),
+                    "score_first_tta/eval_lr": float(args.score_first_tta_lr),
+                    "score_first_tta/eval_commit": float(args.score_first_tta_commit),
                 },
                 step,
             )
@@ -1999,6 +2157,8 @@ def main() -> None:
         graph_lm_metrics: dict[str, float] = {}
         sidecar_metrics: dict[str, float] = {}
         teacher_metrics: dict[str, float] = {}
+        oai_gflownet_metrics: dict[str, float] = {}
+        oai_mtp_metrics: dict[str, float] = {}
         aux_grad_metrics: dict[str, float] = {}
         last_fineweb_x: Tensor | None = None
         last_fineweb_y: Tensor | None = None
@@ -2031,6 +2191,109 @@ def main() -> None:
         train_tokens_per_byte = float((train_token_count / train_byte_count.clamp_min(1.0)).detach().float().item())
         train_bpb = float(train_bits_per_token * train_tokens_per_byte)
         primary_grads = snapshot_base_grads() if args.aux_grad_routing else None
+
+        if (
+            oai_gflownet_head is not None
+            and args.oai_gflownet_every > 0
+            and step % args.oai_gflownet_every == 0
+            and last_fineweb_x is not None
+            and last_fineweb_y is not None
+            and args.oai_gflownet_loss_weight > 0.0
+        ):
+            seq_count = min(max(1, int(args.oai_gflownet_max_sequences)), int(last_fineweb_x.shape[0]))
+            gx = last_fineweb_x[:seq_count]
+            gy = last_fineweb_y[:seq_count]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                _, g_hidden, g_nll = base_model.forward_aux(gx, gy, flatten_graph_output=True)
+                g_out = oai_gflownet_head(
+                    g_hidden,
+                    gy,
+                    g_nll,
+                    max_positions=int(args.oai_gflownet_max_positions),
+                )
+                g_entropy = g_out["oai_gflownet_entropy"].float()
+                g_entropy_objective = (g_entropy - float(args.oai_gflownet_entropy_target)).pow(2)
+                weighted_gflownet_loss = (
+                    float(args.oai_gflownet_loss_weight) * g_out["oai_gflownet_loss"]
+                    + float(args.oai_gflownet_entropy_weight) * g_entropy_objective
+                )
+            if args.aux_grad_routing:
+                saved_base_grads = snapshot_base_grads()
+                zero_base_grads()
+                weighted_gflownet_loss.backward()
+                aux = snapshot_base_grads()
+                routed, metrics = route_aux_grads(primary_grads, aux, name="oai_gflownet")
+                restore_base_grads(saved_base_grads)
+                add_base_grads(routed)
+                aux_grad_metrics.update(metrics)
+            else:
+                weighted_gflownet_loss.backward()
+            oai_gflownet_metrics = {
+                "oai_gflownet/enabled": 1.0,
+                "oai_gflownet/loss": float(g_out["oai_gflownet_loss"].detach().float().item()),
+                "oai_gflownet/weighted_loss": float(weighted_gflownet_loss.detach().float().item()),
+                "oai_gflownet/loss_weight": float(args.oai_gflownet_loss_weight),
+                "oai_gflownet/entropy": float(g_entropy.detach().float().item()),
+                "oai_gflownet/entropy_weight": float(args.oai_gflownet_entropy_weight),
+                "oai_gflownet/entropy_target": float(args.oai_gflownet_entropy_target),
+                "oai_gflownet/entropy_objective": float(g_entropy_objective.detach().float().item()),
+                "oai_gflownet/action_diversity": float(
+                    g_out["oai_gflownet_action_diversity"].detach().float().item()
+                ),
+                "oai_gflownet/reward_mean": float(g_out["oai_gflownet_reward_mean"].detach().float().item()),
+                "oai_gflownet/tb_residual": float(g_out["oai_gflownet_tb_residual"].detach().float().item()),
+                "oai_gflownet/score_gap": float(g_out["oai_gflownet_score_gap"].detach().float().item()),
+                "oai_gflownet/log_z": float(g_out["oai_gflownet_log_z"].detach().float().item()),
+                "oai_gflownet/sequences": float(seq_count),
+                "oai_gflownet/max_positions": float(args.oai_gflownet_max_positions),
+                "oai_gflownet/num_actions": float(args.oai_gflownet_num_actions),
+            }
+
+        if (
+            args.oai_mtp
+            and args.oai_mtp_every > 0
+            and step % args.oai_mtp_every == 0
+            and args.oai_mtp_loss_weight > 0.0
+            and mtp_offsets
+            and last_fineweb_x is not None
+            and last_fineweb_y is not None
+        ):
+            seq_count = min(max(1, int(args.oai_mtp_max_sequences)), int(last_fineweb_x.shape[0]))
+            mx = last_fineweb_x[:seq_count]
+            my = last_fineweb_y[:seq_count]
+            mtp_losses: list[Tensor] = []
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                mtp_hidden = base_model._hidden(mx, flatten_graph_output=True)
+                for offset in mtp_offsets:
+                    if offset > mtp_hidden.shape[1]:
+                        continue
+                    mtp_target = my[:, offset - 1 :]
+                    mtp_source = mtp_hidden[:, : mtp_target.shape[1], :]
+                    mtp_logits = base_model._logits_from_hidden(mtp_source)
+                    mtp_losses.append(F.cross_entropy(mtp_logits.float(), mtp_target.reshape(-1)))
+                mtp_loss = torch.stack(mtp_losses).mean() if mtp_losses else mtp_hidden.new_zeros(())
+                weighted_mtp_loss = float(args.oai_mtp_loss_weight) * mtp_loss
+            if float(weighted_mtp_loss.detach().float().item()) > 0.0:
+                if args.aux_grad_routing:
+                    saved_base_grads = snapshot_base_grads()
+                    zero_base_grads()
+                    weighted_mtp_loss.backward()
+                    aux = snapshot_base_grads()
+                    routed, metrics = route_aux_grads(primary_grads, aux, name="oai_mtp")
+                    restore_base_grads(saved_base_grads)
+                    add_base_grads(routed)
+                    aux_grad_metrics.update(metrics)
+                else:
+                    weighted_mtp_loss.backward()
+            oai_mtp_metrics = {
+                "oai_mtp/enabled": 1.0,
+                "oai_mtp/loss": float(mtp_loss.detach().float().item()),
+                "oai_mtp/weighted_loss": float(weighted_mtp_loss.detach().float().item()),
+                "oai_mtp/loss_weight": float(args.oai_mtp_loss_weight),
+                "oai_mtp/offset_count": float(len(mtp_losses)),
+                "oai_mtp/max_offset": float(max(mtp_offsets) if mtp_offsets else 0),
+                "oai_mtp/sequences": float(seq_count),
+            }
 
         if (
             args.graph_output_calibration_loss_weight > 0.0
@@ -2255,6 +2518,19 @@ def main() -> None:
                     f" teacher_kl:{teacher_metrics.get('teacher_distill/kl', 0.0):.6f}"
                     f" teacher_w:{teacher_metrics.get('teacher_distill/weight', 0.0):.4f}"
                 )
+            gflownet_brief = ""
+            if oai_gflownet_metrics:
+                gflownet_brief = (
+                    f" oai_gfn:{oai_gflownet_metrics.get('oai_gflownet/loss', 0.0):.6f}"
+                    f" gfn_H:{oai_gflownet_metrics.get('oai_gflownet/entropy', 0.0):.4f}"
+                    f" gfn_R:{oai_gflownet_metrics.get('oai_gflownet/reward_mean', 0.0):.4f}"
+                )
+            mtp_brief = ""
+            if oai_mtp_metrics:
+                mtp_brief = (
+                    f" mtp:{oai_mtp_metrics.get('oai_mtp/loss', 0.0):.6f}"
+                    f" mtp_w:{oai_mtp_metrics.get('oai_mtp/loss_weight', 0.0):.4f}"
+                )
             sidecar_brief = ""
             if sidecar_metrics:
                 sidecar_brief = (
@@ -2276,6 +2552,8 @@ def main() -> None:
                 f"step_avg:{approx_training_time_ms / max(step - args.start_step, 1):.2f}ms"
                 f"{graph_lm_brief}"
                 f"{teacher_brief}"
+                f"{gflownet_brief}"
+                f"{mtp_brief}"
                 f"{sidecar_brief}"
             )
             payload = {
@@ -2337,10 +2615,23 @@ def main() -> None:
                 "fineweb_caseops/swapped_token_ids": float(caseops_pairs),
                 "aux_grad_routing/enabled": float(args.aux_grad_routing),
                 "score_first_tta/enabled": float(args.score_first_tta),
+                "score_first_tta/steps": float(args.score_first_tta_steps),
+                "score_first_tta/lr": float(args.score_first_tta_lr),
+                "score_first_tta/commit": float(args.score_first_tta_commit),
+                "oai_gflownet/enabled": float(oai_gflownet_head is not None),
+                "oai_gflownet/loss_weight_config": float(args.oai_gflownet_loss_weight),
+                "oai_gflownet/entropy_weight_config": float(args.oai_gflownet_entropy_weight),
+                "oai_gflownet/every": float(args.oai_gflownet_every),
+                "oai_gflownet/lr": float(args.oai_gflownet_lr),
+                "oai_mtp/enabled": float(args.oai_mtp),
+                "oai_mtp/loss_weight_config": float(args.oai_mtp_loss_weight),
+                "oai_mtp/every": float(args.oai_mtp_every),
             }
             payload.update(flattening_calibration_metrics)
             payload.update(graph_lm_metrics)
             payload.update(teacher_metrics)
+            payload.update(oai_gflownet_metrics)
+            payload.update(oai_mtp_metrics)
             payload.update(sidecar_metrics)
             payload.update(aux_grad_metrics)
             wandb_log0(payload, step)
