@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 
@@ -44,7 +45,7 @@ class Args:
 
 
 def tiny_model(module):
-    return module.GPT(
+    kwargs = dict(
         vocab_size=32,
         num_layers=2,
         model_dim=16,
@@ -56,7 +57,29 @@ def tiny_model(module):
         logit_softcap=30.0,
         rope_base=10000.0,
         qk_gain_init=1.5,
+        fineweb_graphify=True,
+        tokengt_first_class=True,
+        tokengt_graph_radius=2,
+        tokengt_token_class_buckets=8,
+        tokengt_position_buckets=32,
+        tokengt_structural_weight=0.05,
+        tokengt_edge_weight=0.03,
+        tokengt_torus_weight=0.01,
+        tokengt_identifier_dim=8,
+        tokengt_identifier_weight=0.01,
+        tokengt_endpoint_weight=0.01,
+        tokengt_edge_token_weight=0.01,
+        graph_output_flattening=True,
+        graph_output_edge_radius=2,
+        graph_output_node_weight=0.05,
+        graph_output_edge_weight=0.05,
+        graph_output_virtual_edge_tokens=True,
+        graph_output_edge_token_weight=0.03,
+        graph_output_score_correction=True,
+        graph_output_score_correction_weight=0.02,
     )
+    signature = inspect.signature(module.GPT.__init__)
+    return module.GPT(**{key: value for key, value in kwargs.items() if key in signature.parameters})
 
 
 def test_advanced_embedding_losses_are_finite_and_backpropagate() -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
 import math
 import os
 import random
@@ -27,6 +28,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    from toricgt.wandb_organization import configure_wandb_metrics, organize_wandb_payload
+except Exception:  # pragma: no cover - keep this record copy standalone.
+    def organize_wandb_payload(payload, **_kwargs):
+        return payload
+
+    def configure_wandb_metrics(wandb_module, *, step_metric: str = "trainer/step") -> None:
+        wandb_module.define_metric(step_metric)
+        wandb_module.define_metric("*", step_metric=step_metric)
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -100,11 +111,13 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    polarquant_kv_bits = int(os.environ.get("POLARQUANT_KV_BITS", 0))
-    polarquant_train = os.environ.get("POLARQUANT_TRAIN", "0").lower() in {"1", "true", "yes", "on"}
-    polarquant_train_sample_tokens = int(os.environ.get("POLARQUANT_TRAIN_SAMPLE_TOKENS", 0))
-    polarquant_eval_sample_tokens = int(os.environ.get("POLARQUANT_EVAL_SAMPLE_TOKENS", 0))
+    polarquant_kv_bits = int(os.environ.get("POLARQUANT_KV_BITS", 8))
+    polarquant_train = os.environ.get("POLARQUANT_TRAIN", "1").lower() in {"1", "true", "yes", "on"}
+    polarquant_train_sample_tokens = int(os.environ.get("POLARQUANT_TRAIN_SAMPLE_TOKENS", 16))
+    polarquant_eval_sample_tokens = int(os.environ.get("POLARQUANT_EVAL_SAMPLE_TOKENS", 256))
     polarquant_seed = int(os.environ.get("POLARQUANT_SEED", 271828))
+    polarquant_train_start_step = int(os.environ.get("POLARQUANT_TRAIN_START_STEP", 0))
+    polarquant_train_warmup_steps = int(os.environ.get("POLARQUANT_TRAIN_WARMUP_STEPS", 512))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -121,6 +134,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    nonfinite_audit_every = int(os.environ.get("NONFINITE_AUDIT_EVERY", 25))
     bigram_bias = os.environ.get("BIGRAM_BIAS", "0").lower() in {"1", "true", "yes", "on"}
     bigram_bias_lr = float(os.environ.get("BIGRAM_BIAS_LR", 0.05))
     bigram_bias_init_std = float(os.environ.get("BIGRAM_BIAS_INIT_STD", 0.0))
@@ -233,13 +247,21 @@ def advanced_embedding_losses(
     metrics: dict[str, Tensor] = {}
     weighted = zero
 
+    def finite_aux_scalar(name: str, value: Tensor, max_value: float = 1.0e4) -> Tensor:
+        finite = torch.isfinite(value.detach())
+        metrics[f"advanced/{name}_nonfinite"] = (~finite).to(dtype=torch.float32)
+        safe = torch.where(torch.isfinite(value), value, zero)
+        safe = torch.nan_to_num(safe, nan=0.0, posinf=max_value, neginf=0.0)
+        return safe.clamp_min(0.0)
+
     if weights["graphcg"] > 0.0:
         cov = emb.T @ emb / float(n)
         diag = torch.diagonal(cov)
         off = cov - torch.diag(diag)
         graphcg = off.square().mean() / (diag.square().mean().detach() + 1e-6)
+        graphcg = finite_aux_scalar("graphcg_loss", graphcg)
         probs = (diag.abs() + 1e-6) / (diag.abs().sum() + 1e-6)
-        entropy = -(probs * probs.log()).sum() / math.log(max(probs.numel(), 2))
+        entropy = torch.nan_to_num(-(probs * probs.log()).sum() / math.log(max(probs.numel(), 2)), nan=0.0, posinf=1.0, neginf=0.0)
         weighted = weighted + weights["graphcg"] * graphcg
         metrics.update({
             "advanced/graphcg_loss": graphcg.detach(),
@@ -259,6 +281,7 @@ def advanced_embedding_losses(
         top2 = torch.topk(logits, k=2, dim=-1).values
         margin = top2[:, 0] - top2[:, 1]
         toric = (1.0 - entropy) + F.relu(0.15 - margin).mean()
+        toric = finite_aux_scalar("toric_tropical_loss", toric)
         weighted = weighted + weights["toric"] * toric
         metrics.update({
             "advanced/toric_tropical_loss": toric.detach(),
@@ -273,6 +296,7 @@ def advanced_embedding_losses(
         low = max(2, power.size(0) // 5)
         concentration = power[:low].sum() / (power.sum() + 1e-6)
         slepian = 1.0 - concentration
+        slepian = finite_aux_scalar("slepian_pollak_loss", slepian)
         weighted = weighted + weights["slepian"] * slepian
         metrics.update({
             "advanced/slepian_pollak_loss": slepian.detach(),
@@ -288,6 +312,7 @@ def advanced_embedding_losses(
         d2_resid = (d1 @ d2).square().mean() / ((d1.square().mean() * d2.square().mean()).detach() + 1e-6)
         leakage = (a.T @ c / float(n)).square().mean() / ((a.square().mean() * c.square().mean()).detach() + 1e-6)
         koszul = d2_resid + 0.25 * leakage
+        koszul = finite_aux_scalar("koszul_bgg_loss", koszul)
         weighted = weighted + weights["koszul"] * koszul
         metrics.update({
             "advanced/koszul_bgg_loss": koszul.detach(),
@@ -295,22 +320,84 @@ def advanced_embedding_losses(
             "advanced/bgg_standard_leakage": leakage.detach(),
         })
 
+    if (weights["toric"] > 0.0 or weights["koszul"] > 0.0) and seq.size(0) >= 8:
+        try:
+            from toricgt.combinatorial_toric_metrics import (
+                CombinatorialToricConfig,
+                combinatorial_toric_cca_topology_loss,
+            )
+
+            positions = torch.arange(seq.size(0), device=seq.device, dtype=torch.long).view(1, -1)
+            cca_metrics = combinatorial_toric_cca_topology_loss(
+                seq.unsqueeze(0),
+                positions,
+                config=CombinatorialToricConfig(
+                    max_points=min(12, int(getattr(args, "advanced_loss_sample_tokens", 64))),
+                    max_windows=1,
+                    window_size=min(32, seq.size(0)),
+                    step_stride=16,
+                    num_chambers=max(4, int(getattr(args, "toric_tropical_fan_bins", 8))),
+                    temperature=0.16,
+                    max_loss_value=16.0,
+                ),
+            )
+            cca_loss = finite_aux_scalar(
+                "toric_cca_topology_loss",
+                cca_metrics["toric_cca_topology_loss"],
+                max_value=16.0,
+            )
+            cca_weight = 0.15 * weights["toric"] + 0.15 * weights["koszul"]
+            weighted = weighted + cca_weight * cca_loss
+            for cca_key, cca_value in cca_metrics.items():
+                if isinstance(cca_value, torch.Tensor):
+                    metrics[f"advanced/{cca_key}"] = cca_value.detach()
+            metrics["advanced/toric_cca_weight"] = torch.as_tensor(
+                cca_weight,
+                device=seq.device,
+                dtype=torch.float32,
+            )
+            metrics["advanced/toric_cca_bridge_failed"] = torch.zeros((), device=seq.device, dtype=torch.float32)
+        except Exception:
+            metrics["advanced/toric_cca_bridge_failed"] = torch.ones((), device=seq.device, dtype=torch.float32)
+
     if weights["analogy"] > 0.0 and seq.size(0) >= 6:
         deltas = seq[1:] - seq[:-1]
         analogue = (deltas[2:] - deltas[:-2]).square().mean()
         denom = deltas.square().mean().detach() + 1e-6
         analogy = analogue / denom
+        analogy = finite_aux_scalar("analogy_loss", analogy)
         weighted = weighted + weights["analogy"] * analogy
         metrics.update({
             "advanced/analogy_loss": analogy.detach(),
             "advanced/analogical_transport_residual": analogy.detach(),
         })
 
-    total = scale * weighted
+    weighted = finite_aux_scalar("weighted_unscaled_loss", weighted)
+    effective_total = weighted.new_zeros(()) if log_only else scale * weighted
+    total = finite_aux_scalar("aux_loss_total", effective_total)
     metrics["advanced/weighted_unscaled_loss"] = weighted.detach()
+    metrics["advanced/log_only"] = torch.as_tensor(float(log_only), device=weighted.device, dtype=weighted.dtype)
     metrics["advanced/runtime_scale"] = torch.as_tensor(scale, device=weighted.device, dtype=weighted.dtype)
     metrics["advanced/aux_loss"] = total.detach()
     return total, metrics
+
+
+def polarquant_train_runtime_scale(args: object, step: int) -> float:
+    if not bool(getattr(args, "polarquant_train", False)):
+        return 0.0
+    start_step = int(getattr(args, "polarquant_train_start_step", 0))
+    if step < start_step:
+        return 0.0
+    warmup = int(getattr(args, "polarquant_train_warmup_steps", 0))
+    if warmup <= 0:
+        return 1.0
+    return min(max(step - start_step + 1, 0) / float(warmup), 1.0)
+
+
+def set_polarquant_train_scale_(model: nn.Module, scale: float) -> None:
+    for module in model.modules():
+        if hasattr(module, "polarquant_train_scale"):
+            module.polarquant_train_scale.fill_(float(scale))
 
 
 def advanced_loss_runtime_scale(args: object, step: int, best_val_bpb: float) -> float:
@@ -1169,6 +1256,7 @@ class CausalSelfAttention(nn.Module):
         self.polarquant_train = bool(polarquant_train)
         self.polarquant_train_sample_tokens = int(polarquant_train_sample_tokens)
         self.polarquant_eval_sample_tokens = int(polarquant_eval_sample_tokens)
+        self.register_buffer("polarquant_train_scale", torch.ones((), dtype=torch.float32), persistent=False)
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
@@ -1686,7 +1774,7 @@ def main() -> None:
             return
         try:
             metrics.setdefault("trainer/step", step_for_wandb)
-            wandb_run.log(metrics)
+            wandb_run.log(organize_wandb_payload(metrics))
         except Exception as exc:
             log0(f"wandb:log_disabled_after_error:{type(exc).__name__}")
             wandb_run = None
@@ -1727,8 +1815,7 @@ def main() -> None:
                     mode=args.wandb_mode,
                     config=wandb_config,
                 )
-                wandb.define_metric("trainer/step")
-                wandb.define_metric("*", step_metric="trainer/step")
+                configure_wandb_metrics(wandb)
                 log0(
                     f"wandb:enabled entity:{args.wandb_entity} "
                     f"project:{args.wandb_project} run:{args.wandb_run_id}"
@@ -1801,6 +1888,31 @@ def main() -> None:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         path = checkpoint_dir / f"{args.run_id}_step_{step:06d}.pt"
         tmp_path = path.with_suffix(path.suffix + ".tmp")
+        compact_config = {
+            "vocab_size": args.vocab_size,
+            "num_layers": args.num_layers,
+            "model_dim": args.model_dim,
+            "num_heads": args.num_heads,
+            "num_kv_heads": args.num_kv_heads,
+            "mlp_mult": args.mlp_mult,
+            "tie_embeddings": args.tie_embeddings,
+            "bigram_bias": args.bigram_bias,
+            "hash_ngram_bias": args.hash_ngram_bias,
+            "hash_ngram_bias_buckets": args.hash_ngram_bias_buckets,
+            "hash_ngram_bias_order": args.hash_ngram_bias_order,
+            "logit_softcap": args.logit_softcap,
+            "rope_base": args.rope_base,
+            "qk_gain_init": args.qk_gain_init,
+            "bigram_bias_scale": args.bigram_bias_scale,
+            "hash_ngram_bias_scale": args.hash_ngram_bias_scale,
+            "polarquant_kv_bits": args.polarquant_kv_bits,
+            "polarquant_train": args.polarquant_train,
+            "polarquant_train_sample_tokens": args.polarquant_train_sample_tokens,
+            "polarquant_eval_sample_tokens": args.polarquant_eval_sample_tokens,
+            "polarquant_seed": args.polarquant_seed,
+            "polarquant_train_start_step": args.polarquant_train_start_step,
+            "polarquant_train_warmup_steps": args.polarquant_train_warmup_steps,
+        }
         payload = {
             "step": step,
             "training_time_ms": training_time_ms,
@@ -1811,7 +1923,12 @@ def main() -> None:
             "rng_cuda": torch.cuda.get_rng_state_all(),
             "best_val_bpb": best_val_bpb,
             "initial_val_bpb": initial_val_bpb,
+            "config": compact_config,
         }
+        config_sidecar = checkpoint_dir / "run_config.json"
+        config_tmp = config_sidecar.with_suffix(config_sidecar.suffix + ".tmp")
+        config_tmp.write_text(json.dumps(compact_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(config_tmp, config_sidecar)
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path)
         checkpoint_bytes = path.stat().st_size
@@ -1985,6 +2102,8 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        polarquant_train_scale = polarquant_train_runtime_scale(args, step)
+        set_polarquant_train_scale_(base_model, polarquant_train_scale)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         train_aux_loss = torch.zeros((), device=device)
@@ -1992,6 +2111,9 @@ def main() -> None:
         advanced_runtime_scale_sum = torch.zeros((), device=device)
         train_token_count = torch.zeros((), device=device, dtype=torch.float64)
         train_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+        nonfinite_microbatch_skip_count = torch.zeros((), device=device, dtype=torch.float32)
+        nonfinite_ce_loss_count = torch.zeros((), device=device, dtype=torch.float32)
+        nonfinite_aux_loss_count = torch.zeros((), device=device, dtype=torch.float32)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -2000,6 +2122,18 @@ def main() -> None:
                 ce_loss = model(x, y)
             runtime_scale = advanced_loss_runtime_scale(args, step, best_val_bpb)
             aux_loss, aux_metrics = advanced_embedding_losses(base_model, args, x, runtime_scale=runtime_scale)
+            ce_loss_is_finite = torch.isfinite(ce_loss.detach())
+            if not bool(ce_loss_is_finite.item()):
+                nonfinite_ce_loss_count += 1.0
+                aux_metrics["advanced/ce_loss_nonfinite"] = torch.ones((), device=device, dtype=torch.float32)
+            else:
+                aux_metrics["advanced/ce_loss_nonfinite"] = torch.zeros((), device=device, dtype=torch.float32)
+            if not torch.isfinite(aux_loss.detach()):
+                nonfinite_aux_loss_count += 1.0
+                aux_metrics["advanced/aux_loss_nonfinite_suppressed"] = torch.ones((), device=device, dtype=torch.float32)
+                aux_loss = torch.zeros_like(ce_loss)
+            else:
+                aux_metrics["advanced/aux_loss_nonfinite_suppressed"] = torch.zeros((), device=device, dtype=torch.float32)
             if runtime_scale > 0.0 and args.advanced_loss_max_ce_ratio > 0.0:
                 max_aux_loss = ce_loss.detach() * args.advanced_loss_max_ce_ratio
                 aux_loss = torch.minimum(aux_loss, max_aux_loss)
@@ -2013,11 +2147,15 @@ def main() -> None:
                 ).to(dtype=torch.float32)
                 aux_metrics["advanced/aux_loss"] = aux_loss.detach()
             loss = ce_loss + aux_loss
-            train_loss += ce_loss.detach()
-            train_aux_loss += aux_loss.detach()
+            loss_is_finite = torch.isfinite(loss.detach())
+            train_loss += torch.nan_to_num(ce_loss.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+            train_aux_loss += torch.nan_to_num(aux_loss.detach(), nan=0.0, posinf=0.0, neginf=0.0)
             advanced_runtime_scale_sum += torch.as_tensor(runtime_scale, device=device, dtype=torch.float32)
             for key, value in aux_metrics.items():
                 advanced_metric_sums[key] = advanced_metric_sums.get(key, torch.zeros((), device=device)) + value.detach()
+            if not bool(loss_is_finite.item()):
+                nonfinite_microbatch_skip_count += 1.0
+                continue
             (loss * grad_scale).backward()
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
@@ -2046,17 +2184,59 @@ def main() -> None:
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        grad_norm_value = 0.0
+        nonfinite_update_skip = 0.0
+        if (
+            not torch.isfinite(train_loss.detach())
+            or not torch.isfinite(train_aux_loss.detach())
+            or not math.isfinite(train_bpb)
+            or float(nonfinite_microbatch_skip_count.item()) > 0.0
+        ):
+            nonfinite_update_skip = 1.0
+        else:
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["base_lr"] * scale
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
+            if args.grad_clip_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+                grad_norm_value = float(
+                    torch.nan_to_num(
+                        grad_norm.detach().float(),
+                        nan=float("inf"),
+                        posinf=float("inf"),
+                        neginf=float("inf"),
+                    ).item()
+                )
+                if not math.isfinite(grad_norm_value):
+                    nonfinite_update_skip = 1.0
+            if nonfinite_update_skip < 0.5:
+                for opt in optimizers:
+                    opt.step()
+        audit_params = args.nonfinite_audit_every > 0 and (
+            step <= 10 or step % args.nonfinite_audit_every == 0 or nonfinite_update_skip > 0.5
+        )
+        nonfinite_param_count = 0.0
+        nonfinite_grad_count = 0.0
+        max_abs_param = 0.0
+        max_abs_grad = 0.0
+        if audit_params:
+            with torch.no_grad():
+                for param in base_model.parameters():
+                    data = param.detach()
+                    finite_data = torch.isfinite(data)
+                    nonfinite_param_count += float((~finite_data).sum().item())
+                    if finite_data.any():
+                        max_abs_param = max(max_abs_param, float(data[finite_data].abs().max().item()))
+                    if param.grad is not None:
+                        grad = param.grad.detach()
+                        finite_grad = torch.isfinite(grad)
+                        nonfinite_grad_count += float((~finite_grad).sum().item())
+                        if finite_grad.any():
+                            max_abs_grad = max(max_abs_grad, float(grad[finite_grad].abs().max().item()))
         zero_grad_all()
 
         step += 1
@@ -2077,6 +2257,9 @@ def main() -> None:
                 "train/advanced_aux_loss": float(train_aux_loss.item()),
                 "advanced/runtime_scale_applied": float(advanced_runtime_scale_avg.item()),
                 "advanced/backprop_enabled": float(advanced_runtime_scale_avg.item() > 0.0),
+                "polarquant/train_scale": polarquant_train_scale,
+                "polarquant/train_start_step": args.polarquant_train_start_step,
+                "polarquant/train_warmup_steps": args.polarquant_train_warmup_steps,
                 "train/perplexity": math.exp(min(float(train_loss.item()), 20.0)),
                 "train/bpb": train_bpb,
                 "train_bpb": train_bpb,
@@ -2101,6 +2284,15 @@ def main() -> None:
                 "optim/token_lr": token_lr * scale,
                 "optim/matrix_lr": args.matrix_lr * scale,
                 "optim/scalar_lr": args.scalar_lr * scale,
+                "optim/grad_norm": grad_norm_value,
+                "train/nonfinite_update_skip": nonfinite_update_skip,
+                "train/nonfinite_microbatch_skip_count": float(nonfinite_microbatch_skip_count.item()),
+                "train/nonfinite_ce_loss_count": float(nonfinite_ce_loss_count.item()),
+                "train/nonfinite_aux_loss_count": float(nonfinite_aux_loss_count.item()),
+                "train/nonfinite_param_count": nonfinite_param_count,
+                "train/nonfinite_grad_count": nonfinite_grad_count,
+                "optim/max_abs_param": max_abs_param,
+                "optim/max_abs_grad": max_abs_grad,
             }
             if base_model.prev_token_bias is not None:
                 train_metrics["optim/bigram_bias_lr"] = args.bigram_bias_lr * scale
