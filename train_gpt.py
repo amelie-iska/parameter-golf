@@ -79,6 +79,7 @@ class Hyperparameters:
     ) and fineweb_graphify
     tokengt_first_class_lr = float(os.environ.get("TOKENGT_FIRST_CLASS_LR", 2e-4))
     tokengt_graph_radius = int(os.environ.get("TOKENGT_GRAPH_RADIUS", 4))
+    tokengt_distance_features = os.environ.get("TOKENGT_DISTANCE_FEATURES", "functional").strip().lower()
     tokengt_token_class_buckets = int(os.environ.get("TOKENGT_TOKEN_CLASS_BUCKETS", 64))
     tokengt_position_buckets = int(os.environ.get("TOKENGT_POSITION_BUCKETS", 256))
     tokengt_structural_weight = float(os.environ.get("TOKENGT_STRUCTURAL_WEIGHT", 0.050))
@@ -98,6 +99,10 @@ class Hyperparameters:
     )
     graph_output_flattening_lr = float(os.environ.get("GRAPH_OUTPUT_FLATTENING_LR", tokengt_first_class_lr))
     graph_output_edge_radius = int(os.environ.get("GRAPH_OUTPUT_EDGE_RADIUS", tokengt_graph_radius))
+    graph_output_distance_features = os.environ.get(
+        "GRAPH_OUTPUT_DISTANCE_FEATURES",
+        tokengt_distance_features,
+    ).strip().lower()
     graph_output_node_weight = float(os.environ.get("GRAPH_OUTPUT_NODE_WEIGHT", 0.05))
     graph_output_edge_weight = float(os.environ.get("GRAPH_OUTPUT_EDGE_WEIGHT", 0.05))
     graph_output_virtual_edge_tokens = bool(int(os.environ.get("GRAPH_OUTPUT_VIRTUAL_EDGE_TOKENS", "1")))
@@ -175,6 +180,29 @@ class Hyperparameters:
     oai_gflownet_hidden_dim = int(os.environ.get("OAI_GFLOWNET_HIDDEN_DIM", 192))
     oai_gflownet_max_sequences = int(os.environ.get("OAI_GFLOWNET_MAX_SEQUENCES", 2))
     oai_gflownet_max_positions = int(os.environ.get("OAI_GFLOWNET_MAX_POSITIONS", 192))
+    oai_embedding_fot = bool(int(os.environ.get("OAI_EMBEDDING_FOT", "0")))
+    oai_fot_lr = float(os.environ.get("OAI_FOT_LR", 1.5e-4))
+    oai_fot_every = int(os.environ.get("OAI_FOT_EVERY", 1))
+    oai_fot_loss_weight = float(os.environ.get("OAI_FOT_LOSS_WEIGHT", 0.0))
+    oai_fot_num_trees = int(os.environ.get("OAI_FOT_NUM_TREES", 4))
+    oai_fot_max_depth = int(os.environ.get("OAI_FOT_MAX_DEPTH", 5))
+    oai_fot_branching = int(os.environ.get("OAI_FOT_BRANCHING", 4))
+    oai_fot_topk_trees = int(os.environ.get("OAI_FOT_TOPK_TREES", 2))
+    oai_fot_hidden_dim = int(os.environ.get("OAI_FOT_HIDDEN_DIM", 192))
+    oai_fot_max_sequences = int(os.environ.get("OAI_FOT_MAX_SEQUENCES", 2))
+    oai_fot_max_positions = int(os.environ.get("OAI_FOT_MAX_POSITIONS", 192))
+    oai_fot_consensus_buckets = int(os.environ.get("OAI_FOT_CONSENSUS_BUCKETS", 64))
+    oai_fot_correction_scale = float(os.environ.get("OAI_FOT_CORRECTION_SCALE", 0.08))
+    oai_fot_ucb_exploration = float(os.environ.get("OAI_FOT_UCB_EXPLORATION", 1.25))
+    oai_fot_temperature = float(os.environ.get("OAI_FOT_TEMPERATURE", 0.70))
+    oai_fot_sparse_weight = float(os.environ.get("OAI_FOT_SPARSE_WEIGHT", 1.0))
+    oai_fot_ucb_weight = float(os.environ.get("OAI_FOT_UCB_WEIGHT", 0.5))
+    oai_fot_correction_weight = float(os.environ.get("OAI_FOT_CORRECTION_WEIGHT", 0.5))
+    oai_fot_consensus_weight = float(os.environ.get("OAI_FOT_CONSENSUS_WEIGHT", 0.75))
+    oai_fot_tb_weight = float(os.environ.get("OAI_FOT_TB_WEIGHT", 1.0))
+    oai_fot_subtb_weight = float(os.environ.get("OAI_FOT_SUBTB_WEIGHT", 0.0))
+    oai_fot_complexity_weight = float(os.environ.get("OAI_FOT_COMPLEXITY_WEIGHT", 0.05))
+    oai_fot_reward_advanced_bonus = float(os.environ.get("OAI_FOT_REWARD_ADVANCED_BONUS", 0.0))
     oai_mtp = bool(int(os.environ.get("OAI_MTP", "0")))
     oai_mtp_lr = float(os.environ.get("OAI_MTP_LR", tokengt_first_class_lr))
     oai_mtp_every = int(os.environ.get("OAI_MTP_EVERY", 1))
@@ -199,6 +227,33 @@ class Hyperparameters:
     toric_bgg_loss_weight = float(os.environ.get("TORIC_BGG_LOSS_WEIGHT", 0.0))
     koszul_persistence_loss_weight = float(os.environ.get("KOSZUL_PERSISTENCE_LOSS_WEIGHT", 0.0))
     combinatorial_toric_loss_weight = float(os.environ.get("COMBINATORIAL_TORIC_LOSS_WEIGHT", 0.0))
+    derived_signature_loss_weight = float(os.environ.get("DERIVED_SIGNATURE_LOSS_WEIGHT", 1e-6))
+    advanced_lagrangian_controller = bool(int(os.environ.get("ADVANCED_LAGRANGIAN_CONTROLLER", "1")))
+    lagrangian_dual_lr = float(os.environ.get("LAGRANGIAN_DUAL_LR", 0.025))
+    lagrangian_decay = float(os.environ.get("LAGRANGIAN_DECAY", 0.985))
+    lagrangian_min_multiplier = float(os.environ.get("LAGRANGIAN_MIN_MULTIPLIER", 0.25))
+    lagrangian_max_multiplier = float(os.environ.get("LAGRANGIAN_MAX_MULTIPLIER", 2.25))
+    lagrangian_bpb_ceiling = float(os.environ.get("LAGRANGIAN_BPB_CEILING", 3.05))
+    lagrangian_bpb_softness = float(os.environ.get("LAGRANGIAN_BPB_SOFTNESS", 0.35))
+    lagrangian_graphcg_target = float(os.environ.get("LAGRANGIAN_GRAPHCG_TARGET", 0.010))
+    lagrangian_analogy_target = float(os.environ.get("LAGRANGIAN_ANALOGY_TARGET", 0.045))
+    lagrangian_tokengt_graph_target = float(os.environ.get("LAGRANGIAN_TOKENGT_GRAPH_TARGET", 0.75))
+    lagrangian_memory_target = float(os.environ.get("LAGRANGIAN_MEMORY_TARGET", 1.15))
+    lagrangian_toric_target = float(os.environ.get("LAGRANGIAN_TORIC_TARGET", 2.0))
+    lagrangian_vector_bundle_target = float(os.environ.get("LAGRANGIAN_VECTOR_BUNDLE_TARGET", 0.45))
+    lagrangian_bgg_target = float(os.environ.get("LAGRANGIAN_BGG_TARGET", 0.06))
+    lagrangian_koszul_target = float(os.environ.get("LAGRANGIAN_KOSZUL_TARGET", 0.035))
+    lagrangian_cca_target = float(os.environ.get("LAGRANGIAN_CCA_TARGET", 1.0))
+    lagrangian_derived_signature_target = float(os.environ.get("LAGRANGIAN_DERIVED_SIGNATURE_TARGET", 0.025))
+    toric_fan_curriculum = bool(int(os.environ.get("TORIC_FAN_CURRICULUM", "1")))
+    toric_fan_coarse_steps = int(os.environ.get("TORIC_FAN_COARSE_STEPS", 450))
+    toric_fan_intermediate_steps = int(os.environ.get("TORIC_FAN_INTERMEDIATE_STEPS", 950))
+    memory_sheaf_gate_min = float(os.environ.get("MEMORY_SHEAF_GATE_MIN", 0.15))
+    memory_sheaf_gate_threshold = float(os.environ.get("MEMORY_SHEAF_GATE_THRESHOLD", 0.12))
+    memory_sheaf_gate_softness = float(os.environ.get("MEMORY_SHEAF_GATE_SOFTNESS", 0.18))
+    memory_sheaf_ce_weight = float(os.environ.get("MEMORY_SHEAF_CE_WEIGHT", 1.0))
+    derived_signature_max_vertices = int(os.environ.get("DERIVED_SIGNATURE_MAX_VERTICES", 8))
+    derived_signature_max_edges = int(os.environ.get("DERIVED_SIGNATURE_MAX_EDGES", 64))
     toric_geometry_num_exponents = int(os.environ.get("TORIC_GEOMETRY_NUM_EXPONENTS", 16))
     toric_geometry_exponent_dim = int(os.environ.get("TORIC_GEOMETRY_EXPONENT_DIM", 4))
     toric_geometry_probe_rank = int(os.environ.get("TORIC_GEOMETRY_PROBE_RANK", 12))
@@ -746,6 +801,7 @@ class DistributedTokenLoader:
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 
+from toricgt.embedding_forest_of_thought import EmbeddingFoTConfig, EmbeddingForestOfThoughtHead
 from toricgt.oai_sidecar import GraphParquetTokenStream, ToricGTSidecar
 
 # -----------------------------
@@ -888,6 +944,7 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         token_class_buckets: int,
         position_buckets: int,
         edge_radius: int,
+        distance_features: str,
         structural_weight: float,
         edge_weight: float,
         torus_weight: float,
@@ -904,12 +961,15 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
             raise ValueError("TOKENGT_POSITION_BUCKETS must be positive")
         if edge_radius < 0:
             raise ValueError("TOKENGT_GRAPH_RADIUS must be nonnegative")
+        if distance_features not in {"embedding", "functional"}:
+            raise ValueError("TOKENGT_DISTANCE_FEATURES must be 'embedding' or 'functional'")
         if identifier_dim <= 0:
             raise ValueError("TOKENGT_IDENTIFIER_DIM must be positive")
         self.dim = int(dim)
         self.token_class_buckets = int(token_class_buckets)
         self.position_buckets = int(position_buckets)
         self.edge_radius = int(edge_radius)
+        self.distance_features = str(distance_features)
         self.structural_weight = float(structural_weight)
         self.edge_weight = float(edge_weight)
         self.torus_weight = float(torus_weight)
@@ -921,8 +981,12 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         self.theta = float(theta)
         self.token_class_emb = nn.Embedding(self.token_class_buckets, dim)
         self.position_bucket_emb = nn.Embedding(self.position_buckets, dim)
-        self.indegree_emb = nn.Embedding(max(1, self.edge_radius + 1), dim)
-        self.edge_distance_emb = nn.Embedding(max(1, self.edge_radius + 1), dim)
+        self.indegree_emb = (
+            nn.Embedding(max(1, self.edge_radius + 1), dim) if self.distance_features == "embedding" else None
+        )
+        self.edge_distance_emb = (
+            nn.Embedding(max(1, self.edge_radius + 1), dim) if self.distance_features == "embedding" else None
+        )
         self.edge_source_class_emb = nn.Embedding(self.token_class_buckets, dim)
         self.torus_proj = CastedLinear(4, dim, bias=False)
         self.identifier_proj = CastedLinear(self.identifier_feature_dim, dim, bias=False)
@@ -947,6 +1011,26 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         features = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
         return (features / math.sqrt(float(self.identifier_feature_dim))).to(dtype=dtype)
 
+    def _distance_features(self, distance_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        distance = distance_ids.to(dtype=torch.float32)
+        half = (self.dim + 1) // 2
+        freq = torch.exp(
+            torch.linspace(0.0, -math.log(10000.0), half, device=distance_ids.device, dtype=torch.float32)
+        )
+        phase = distance.unsqueeze(-1) * freq.view(*((1,) * distance.ndim), -1)
+        features = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)[..., : self.dim]
+        return (features / math.sqrt(float(self.dim))).to(dtype=dtype)
+
+    def _indegree_signal(self, indegree: Tensor, dtype: torch.dtype) -> Tensor:
+        if self.indegree_emb is not None:
+            return self.indegree_emb(indegree)
+        return self._distance_features(indegree, dtype)
+
+    def _edge_distance_signal(self, distance_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        if self.edge_distance_emb is not None:
+            return self.edge_distance_emb(distance_ids)
+        return self._distance_features(distance_ids, dtype)
+
     def forward(self, input_ids: Tensor) -> Tensor:
         bsz, seqlen = input_ids.shape
         device = input_ids.device
@@ -957,7 +1041,7 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         structural = (
             self.token_class_emb(token_class)
             + self.position_bucket_emb(position_bucket)
-            + self.indegree_emb(indegree)
+            + self._indegree_signal(indegree, self.token_class_emb.weight.dtype)
         )
         identifier_features = self._identifier_features(positions, structural.dtype)
         identifier_context = self.identifier_proj(identifier_features)
@@ -972,7 +1056,7 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
                 valid = (positions >= distance).to(dtype=structural.dtype).unsqueeze(-1)
                 dist_ids = torch.full_like(token_class, distance)
                 local_edge = (
-                    self.edge_source_class_emb(source_class) + self.edge_distance_emb(dist_ids)
+                    self.edge_source_class_emb(source_class) + self._edge_distance_signal(dist_ids, structural.dtype)
                 )
                 edge_context = edge_context + valid * local_edge
                 source_positions = (positions - distance).clamp_min(0)
@@ -1022,6 +1106,7 @@ class GraphOutputFlatteningAdapter(nn.Module):
         dim: int,
         *,
         edge_radius: int,
+        distance_features: str,
         node_weight: float,
         edge_weight: float,
         virtual_edge_tokens: bool,
@@ -1032,8 +1117,11 @@ class GraphOutputFlatteningAdapter(nn.Module):
         super().__init__()
         if edge_radius < 0:
             raise ValueError("GRAPH_OUTPUT_EDGE_RADIUS must be nonnegative")
+        if distance_features not in {"embedding", "functional"}:
+            raise ValueError("GRAPH_OUTPUT_DISTANCE_FEATURES must be 'embedding' or 'functional'")
         self.dim = int(dim)
         self.edge_radius = int(edge_radius)
+        self.distance_features = str(distance_features)
         self.node_weight = float(node_weight)
         self.edge_weight = float(edge_weight)
         self.virtual_edge_tokens = bool(virtual_edge_tokens)
@@ -1042,12 +1130,29 @@ class GraphOutputFlatteningAdapter(nn.Module):
         self.score_correction_weight = float(score_correction_weight)
         self.node_proj = CastedLinear(dim, dim, bias=False)
         self.edge_proj = CastedLinear(dim, dim, bias=False)
-        self.edge_distance_emb = nn.Embedding(max(1, self.edge_radius + 1), dim)
+        self.edge_distance_emb = (
+            nn.Embedding(max(1, self.edge_radius + 1), dim) if self.distance_features == "embedding" else None
+        )
         self.node_proj._zero_init = True
         self.edge_proj._zero_init = True
         self.gate = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
         self.edge_token_gate = nn.Parameter(torch.tensor(-2.5, dtype=torch.float32))
         self.score_correction_gate = nn.Parameter(torch.tensor(-3.0, dtype=torch.float32))
+
+    def _distance_features(self, distance_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        distance = distance_ids.to(dtype=torch.float32)
+        half = (self.dim + 1) // 2
+        freq = torch.exp(
+            torch.linspace(0.0, -math.log(10000.0), half, device=distance_ids.device, dtype=torch.float32)
+        )
+        phase = distance.unsqueeze(-1) * freq.view(*((1,) * distance.ndim), -1)
+        features = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)[..., : self.dim]
+        return (features / math.sqrt(float(self.dim))).to(dtype=dtype)
+
+    def _edge_distance_signal(self, distance_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        if self.edge_distance_emb is not None:
+            return self.edge_distance_emb(distance_ids).to(dtype=dtype)
+        return self._distance_features(distance_ids, dtype)
 
     def forward(self, graph_hidden: Tensor) -> Tensor:
         if self.edge_radius > 0:
@@ -1070,7 +1175,7 @@ class GraphOutputFlatteningAdapter(nn.Module):
                     virtual_edge = (
                         shifted
                         + graph_hidden
-                        + self.edge_distance_emb(dist_ids).to(dtype=graph_hidden.dtype)
+                        + self._edge_distance_signal(dist_ids, graph_hidden.dtype)
                     )
                     edge_token_context = edge_token_context + valid * virtual_edge
                 valid_count = valid_count + valid
@@ -1217,6 +1322,7 @@ class GPT(nn.Module):
         fineweb_graphify: bool,
         tokengt_first_class: bool,
         tokengt_graph_radius: int,
+        tokengt_distance_features: str,
         tokengt_token_class_buckets: int,
         tokengt_position_buckets: int,
         tokengt_structural_weight: float,
@@ -1228,6 +1334,7 @@ class GPT(nn.Module):
         tokengt_edge_token_weight: float,
         graph_output_flattening: bool,
         graph_output_edge_radius: int,
+        graph_output_distance_features: str,
         graph_output_node_weight: float,
         graph_output_edge_weight: float,
         graph_output_virtual_edge_tokens: bool,
@@ -1251,6 +1358,7 @@ class GPT(nn.Module):
                 token_class_buckets=tokengt_token_class_buckets,
                 position_buckets=tokengt_position_buckets,
                 edge_radius=tokengt_graph_radius,
+                distance_features=tokengt_distance_features,
                 structural_weight=tokengt_structural_weight,
                 edge_weight=tokengt_edge_weight,
                 torus_weight=tokengt_torus_weight,
@@ -1266,6 +1374,7 @@ class GPT(nn.Module):
             GraphOutputFlatteningAdapter(
                 model_dim,
                 edge_radius=graph_output_edge_radius,
+                distance_features=graph_output_distance_features,
                 node_weight=graph_output_node_weight,
                 edge_weight=graph_output_edge_weight,
                 virtual_edge_tokens=graph_output_virtual_edge_tokens,
@@ -1553,6 +1662,7 @@ def main() -> None:
         fineweb_graphify=args.fineweb_graphify,
         tokengt_first_class=args.tokengt_first_class,
         tokengt_graph_radius=args.tokengt_graph_radius,
+        tokengt_distance_features=args.tokengt_distance_features,
         tokengt_token_class_buckets=args.tokengt_token_class_buckets,
         tokengt_position_buckets=args.tokengt_position_buckets,
         tokengt_structural_weight=args.tokengt_structural_weight,
@@ -1564,6 +1674,7 @@ def main() -> None:
         tokengt_edge_token_weight=args.tokengt_edge_token_weight,
         graph_output_flattening=args.graph_output_flattening,
         graph_output_edge_radius=args.graph_output_edge_radius,
+        graph_output_distance_features=args.graph_output_distance_features,
         graph_output_node_weight=args.graph_output_node_weight,
         graph_output_edge_weight=args.graph_output_edge_weight,
         graph_output_virtual_edge_tokens=args.graph_output_virtual_edge_tokens,
@@ -1579,6 +1690,7 @@ def main() -> None:
     graph_loader = None
     graph_lm_loader = None
     oai_gflownet_head = None
+    oai_fot_head = None
     if args.graph_lm_primary:
         if args.graph_lm_batch_size < 1:
             raise ValueError("GRAPH_LM_BATCH_SIZE must be at least 1")
@@ -1616,6 +1728,30 @@ def main() -> None:
             num_actions=args.oai_gflownet_num_actions,
             hidden_dim=args.oai_gflownet_hidden_dim,
         ).to(device)
+    if args.oai_embedding_fot:
+        oai_fot_head = EmbeddingForestOfThoughtHead(
+            EmbeddingFoTConfig(
+                dim=args.model_dim,
+                num_trees=args.oai_fot_num_trees,
+                max_depth=args.oai_fot_max_depth,
+                branching=args.oai_fot_branching,
+                topk_trees=args.oai_fot_topk_trees,
+                hidden_dim=args.oai_fot_hidden_dim,
+                max_positions=args.oai_fot_max_positions,
+                consensus_buckets=args.oai_fot_consensus_buckets,
+                correction_scale=args.oai_fot_correction_scale,
+                ucb_exploration=args.oai_fot_ucb_exploration,
+                temperature=args.oai_fot_temperature,
+                sparse_weight=args.oai_fot_sparse_weight,
+                ucb_weight=args.oai_fot_ucb_weight,
+                correction_weight=args.oai_fot_correction_weight,
+                consensus_weight=args.oai_fot_consensus_weight,
+                tb_weight=args.oai_fot_tb_weight,
+                subtb_weight=args.oai_fot_subtb_weight,
+                complexity_weight=args.oai_fot_complexity_weight,
+                reward_advanced_bonus=args.oai_fot_reward_advanced_bonus,
+            )
+        ).to(device)
     if args.require_toricgt_sidecar and sidecar is None:
         raise RuntimeError("REQUIRE_TORICGT_SIDECAR=1 but the ToricGT sidecar is disabled")
     if args.require_graph_lm_primary and graph_lm_loader is None:
@@ -1629,6 +1765,8 @@ def main() -> None:
                 sidecar.load_state_dict(checkpoint["sidecar"], strict=True)
             if oai_gflownet_head is not None and checkpoint.get("oai_gflownet") is not None:
                 oai_gflownet_head.load_state_dict(checkpoint["oai_gflownet"], strict=True)
+            if oai_fot_head is not None and checkpoint.get("oai_fot") is not None:
+                oai_fot_head.load_state_dict(checkpoint["oai_fot"], strict=True)
             if args.start_step <= 0:
                 args.start_step = int(checkpoint.get("step", 0))
         else:
@@ -1652,6 +1790,7 @@ def main() -> None:
             fineweb_graphify=args.fineweb_graphify,
             tokengt_first_class=args.tokengt_first_class,
             tokengt_graph_radius=args.tokengt_graph_radius,
+            tokengt_distance_features=args.tokengt_distance_features,
             tokengt_token_class_buckets=args.tokengt_token_class_buckets,
             tokengt_position_buckets=args.tokengt_position_buckets,
             tokengt_structural_weight=args.tokengt_structural_weight,
@@ -1663,6 +1802,7 @@ def main() -> None:
             tokengt_edge_token_weight=args.tokengt_edge_token_weight,
             graph_output_flattening=args.graph_output_flattening,
             graph_output_edge_radius=args.graph_output_edge_radius,
+            graph_output_distance_features=args.graph_output_distance_features,
             graph_output_node_weight=args.graph_output_node_weight,
             graph_output_edge_weight=args.graph_output_edge_weight,
             graph_output_virtual_edge_tokens=args.graph_output_virtual_edge_tokens,
@@ -1797,17 +1937,33 @@ def main() -> None:
             fused=True,
         )
         optimizers.append(optimizer_oai_gflownet)
+    if oai_fot_head is not None:
+        optimizer_oai_fot = torch.optim.AdamW(
+            [
+                {
+                    "params": list(oai_fot_head.parameters()),
+                    "lr": args.oai_fot_lr,
+                    "base_lr": args.oai_fot_lr,
+                }
+            ],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_oai_fot)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     first_class_tokengt_param_count = sum(p.numel() for p in first_class_tokengt_params)
     graph_output_flattening_param_count = sum(p.numel() for p in graph_output_flattening_params)
     sidecar_params = sum(p.numel() for p in sidecar.parameters()) if sidecar is not None else 0
     oai_gflownet_params = sum(p.numel() for p in oai_gflownet_head.parameters()) if oai_gflownet_head is not None else 0
+    oai_fot_params = sum(p.numel() for p in oai_fot_head.parameters()) if oai_fot_head is not None else 0
     log0(f"model_params:{n_params}")
     log0(
         "fineweb_graphification:"
         f"enabled:{int(args.fineweb_graphify)} tokengt_first_class:{int(args.tokengt_first_class)} "
         f"params:{first_class_tokengt_param_count} radius:{args.tokengt_graph_radius} "
+        f"distance_features:{args.tokengt_distance_features} "
         f"token_class_buckets:{args.tokengt_token_class_buckets} position_buckets:{args.tokengt_position_buckets} "
         f"weights:structural={args.tokengt_structural_weight},edge={args.tokengt_edge_weight},"
         f"torus={args.tokengt_torus_weight},identifier={args.tokengt_identifier_weight},"
@@ -1818,6 +1974,7 @@ def main() -> None:
         "graph_output_flattening:"
         f"enabled:{int(base_model.graph_output_flattening is not None)} "
         f"params:{graph_output_flattening_param_count} radius:{args.graph_output_edge_radius} "
+        f"distance_features:{args.graph_output_distance_features} "
         f"weights:node={args.graph_output_node_weight},edge={args.graph_output_edge_weight},"
         f"virtual_edge={args.graph_output_edge_token_weight},"
         f"score_correction={args.graph_output_score_correction_weight} "
@@ -1847,6 +2004,7 @@ def main() -> None:
         f"toric_geometry={args.toric_geometry_loss_weight},vector_bundle_1d_cone_ce={args.toric_vector_bundle_loss_weight},"
         f"toric_bgg={args.toric_bgg_loss_weight},koszul={args.koszul_persistence_loss_weight},"
         f"combinatorial_toric={args.combinatorial_toric_loss_weight},"
+        f"derived_signature={args.derived_signature_loss_weight},"
         f"compute_all_metrics={args.sidecar_compute_all_metrics}"
     )
     log0(
@@ -1855,6 +2013,13 @@ def main() -> None:
         f"sidecar:{int(args.aux_grad_route_sidecar)} teacher:{int(args.aux_grad_route_teacher)} "
         f"retrieval_conditioned_aux:{int(args.retrieval_conditioned_aux)} "
         f"uncertainty_weighting:{int(args.sidecar_uncertainty_weighting)} "
+        f"lagrangian_controller:{int(args.advanced_lagrangian_controller)} "
+        f"lagrangian_dual_lr:{args.lagrangian_dual_lr} "
+        f"lagrangian_bpb_ceiling:{args.lagrangian_bpb_ceiling} "
+        f"toric_fan_curriculum:{int(args.toric_fan_curriculum)} "
+        f"fan_steps:{args.toric_fan_coarse_steps}/{args.toric_fan_intermediate_steps} "
+        f"memory_sheaf_gate:min={args.memory_sheaf_gate_min},threshold={args.memory_sheaf_gate_threshold},"
+        f"softness={args.memory_sheaf_gate_softness} "
         f"graphcg_bpb_orthogonal_weight:{args.graphcg_bpb_orthogonal_weight} "
         f"score_first_tta:{int(args.score_first_tta)} "
         f"score_first_tta_commit:{int(args.score_first_tta_commit)}"
@@ -1866,6 +2031,12 @@ def main() -> None:
         f"gflownet_weight:{args.oai_gflownet_loss_weight} "
         f"gflownet_entropy_weight:{args.oai_gflownet_entropy_weight} "
         f"gflownet_actions:{args.oai_gflownet_num_actions} "
+        f"fot_enabled:{int(oai_fot_head is not None)} "
+        f"fot_params:{oai_fot_params} "
+        f"fot_weight:{args.oai_fot_loss_weight} "
+        f"fot_trees:{args.oai_fot_num_trees} "
+        f"fot_depth:{args.oai_fot_max_depth} "
+        f"fot_branching:{args.oai_fot_branching} "
         f"mtp_enabled:{int(args.oai_mtp)} mtp_weight:{args.oai_mtp_loss_weight} "
         f"mtp_offsets:{args.oai_mtp_offsets}"
     )
@@ -1879,7 +2050,8 @@ def main() -> None:
         f"toric_vector_bundle_1d_cone_sheaf:{int(sidecar is not None)} "
         f"toric_bgg_category_o:{int(sidecar is not None)} "
         f"koszul_persistence:{int(sidecar is not None)} "
-        f"combinatorial_toric_commutative_algebra:{int(sidecar is not None)}"
+        f"combinatorial_toric_commutative_algebra:{int(sidecar is not None)} "
+        f"derived_signature_distillation:{int(sidecar is not None)}"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -2045,8 +2217,10 @@ def main() -> None:
             "model": base_model.state_dict(),
             "sidecar": sidecar.state_dict() if sidecar is not None else None,
             "oai_gflownet": oai_gflownet_head.state_dict() if oai_gflownet_head is not None else None,
+            "oai_fot": oai_fot_head.state_dict() if oai_fot_head is not None else None,
             "toricgt_sidecar_enabled": bool(sidecar is not None),
             "oai_gflownet_enabled": bool(oai_gflownet_head is not None),
+            "oai_embedding_fot_enabled": bool(oai_fot_head is not None),
             "graph_lm_primary_enabled": bool(graph_lm_loader is not None),
             "graph_output_flattening_enabled": bool(base_model.graph_output_flattening is not None),
             "val_loss": val_loss_value,
@@ -2158,6 +2332,7 @@ def main() -> None:
         sidecar_metrics: dict[str, float] = {}
         teacher_metrics: dict[str, float] = {}
         oai_gflownet_metrics: dict[str, float] = {}
+        oai_fot_metrics: dict[str, float] = {}
         oai_mtp_metrics: dict[str, float] = {}
         aux_grad_metrics: dict[str, float] = {}
         last_fineweb_x: Tensor | None = None
@@ -2247,6 +2422,84 @@ def main() -> None:
                 "oai_gflownet/sequences": float(seq_count),
                 "oai_gflownet/max_positions": float(args.oai_gflownet_max_positions),
                 "oai_gflownet/num_actions": float(args.oai_gflownet_num_actions),
+            }
+
+        if (
+            oai_fot_head is not None
+            and args.oai_fot_every > 0
+            and step % args.oai_fot_every == 0
+            and last_fineweb_x is not None
+            and last_fineweb_y is not None
+            and args.oai_fot_loss_weight > 0.0
+        ):
+            seq_count = min(max(1, int(args.oai_fot_max_sequences)), int(last_fineweb_x.shape[0]))
+            fx = last_fineweb_x[:seq_count]
+            fy = last_fineweb_y[:seq_count]
+            advanced_signal = None
+            if oai_gflownet_metrics:
+                advanced_signal = torch.full(
+                    (seq_count,),
+                    float(oai_gflownet_metrics.get("oai_gflownet/reward_mean", 0.0)),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                _, f_hidden, f_nll = base_model.forward_aux(fx, fy, flatten_graph_output=True)
+                f_out = oai_fot_head(f_hidden, fy, f_nll, advanced_signal=advanced_signal)
+                weighted_fot_loss = float(args.oai_fot_loss_weight) * f_out["oai_fot_loss"]
+            if args.aux_grad_routing:
+                saved_base_grads = snapshot_base_grads()
+                zero_base_grads()
+                weighted_fot_loss.backward()
+                aux = snapshot_base_grads()
+                routed, metrics = route_aux_grads(primary_grads, aux, name="oai_fot")
+                restore_base_grads(saved_base_grads)
+                add_base_grads(routed)
+                aux_grad_metrics.update(metrics)
+            else:
+                weighted_fot_loss.backward()
+            oai_fot_metrics = {
+                "oai_fot/enabled": 1.0,
+                "oai_fot/loss": float(f_out["oai_fot_loss"].detach().float().item()),
+                "oai_fot/weighted_loss": float(weighted_fot_loss.detach().float().item()),
+                "oai_fot/loss_weight": float(args.oai_fot_loss_weight),
+                "oai_fot/sparse_activation_loss": float(
+                    f_out["oai_fot_sparse_activation_loss"].detach().float().item()
+                ),
+                "oai_fot/ucb_loss": float(f_out["oai_fot_ucb_loss"].detach().float().item()),
+                "oai_fot/self_correction_loss": float(
+                    f_out["oai_fot_self_correction_loss"].detach().float().item()
+                ),
+                "oai_fot/consensus_loss": float(f_out["oai_fot_consensus_loss"].detach().float().item()),
+                "oai_fot/tb_loss": float(f_out["oai_fot_tb_loss"].detach().float().item()),
+                "oai_fot/subtb_loss": float(f_out["oai_fot_subtb_loss"].detach().float().item()),
+                "oai_fot/complexity_loss": float(f_out["oai_fot_complexity_loss"].detach().float().item()),
+                "oai_fot/activation_entropy": float(
+                    f_out["oai_fot_activation_entropy"].detach().float().item()
+                ),
+                "oai_fot/active_tree_count": float(f_out["oai_fot_active_tree_count"].detach().float().item()),
+                "oai_fot/active_mass_topk": float(f_out["oai_fot_active_mass_topk"].detach().float().item()),
+                "oai_fot/tree_diversity": float(f_out["oai_fot_tree_diversity"].detach().float().item()),
+                "oai_fot/value_mean": float(f_out["oai_fot_value_mean"].detach().float().item()),
+                "oai_fot/reward_mean": float(f_out["oai_fot_reward_mean"].detach().float().item()),
+                "oai_fot/tb_residual": float(f_out["oai_fot_tb_residual"].detach().float().item()),
+                "oai_fot/correction_cosine": float(
+                    f_out["oai_fot_correction_cosine"].detach().float().item()
+                ),
+                "oai_fot/correction_bpb_proxy_lift": float(
+                    f_out["oai_fot_correction_bpb_proxy_lift"].detach().float().item()
+                ),
+                "oai_fot/consensus_margin": float(f_out["oai_fot_consensus_margin"].detach().float().item()),
+                "oai_fot/consensus_entropy": float(f_out["oai_fot_consensus_entropy"].detach().float().item()),
+                "oai_fot/consensus_tree_agreement": float(
+                    f_out["oai_fot_consensus_tree_agreement"].detach().float().item()
+                ),
+                "oai_fot/log_z": float(f_out["oai_fot_log_z"].detach().float().item()),
+                "oai_fot/sequences": float(seq_count),
+                "oai_fot/max_positions": float(args.oai_fot_max_positions),
+                "oai_fot/num_trees": float(f_out["oai_fot_num_trees"].detach().float().item()),
+                "oai_fot/node_count": float(f_out["oai_fot_node_count"].detach().float().item()),
+                "oai_fot/topk_trees": float(f_out["oai_fot_topk_trees"].detach().float().item()),
             }
 
         if (
@@ -2442,7 +2695,7 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 sidecar_lm_loss, sidecar_hidden, sidecar_nll = base_model.forward_aux(sx, sy)
                 positions = torch.arange(sx.shape[1], device=device, dtype=torch.float32).unsqueeze(0).expand(sx.shape[0], -1)
-                sidecar_out = sidecar(sidecar_hidden, sy, positions, sidecar_nll)
+                sidecar_out = sidecar(sidecar_hidden, sy, positions, sidecar_nll, step=step)
                 sidecar_loss = float(scheduled_sidecar_weight) * sidecar_out["toricgt_sidecar_loss"]
             if args.aux_grad_routing and args.aux_grad_route_sidecar:
                 saved_base_grads = snapshot_base_grads()
@@ -2478,6 +2731,7 @@ def main() -> None:
                     "toricgt_sidecar/toric_bgg_loss",
                     "toricgt_sidecar/koszul_persistence_loss",
                     "toricgt_sidecar/toric_cca_topology_loss",
+                    "toricgt_sidecar/derived_signature_loss",
                 )
                 missing = [name for name in required if name not in sidecar_metrics]
                 if missing:
@@ -2525,6 +2779,14 @@ def main() -> None:
                     f" gfn_H:{oai_gflownet_metrics.get('oai_gflownet/entropy', 0.0):.4f}"
                     f" gfn_R:{oai_gflownet_metrics.get('oai_gflownet/reward_mean', 0.0):.4f}"
                 )
+            fot_brief = ""
+            if oai_fot_metrics:
+                fot_brief = (
+                    f" oai_fot:{oai_fot_metrics.get('oai_fot/loss', 0.0):.6f}"
+                    f" fot_H:{oai_fot_metrics.get('oai_fot/activation_entropy', 0.0):.4f}"
+                    f" fot_R:{oai_fot_metrics.get('oai_fot/reward_mean', 0.0):.4f}"
+                    f" fot_div:{oai_fot_metrics.get('oai_fot/tree_diversity', 0.0):.4f}"
+                )
             mtp_brief = ""
             if oai_mtp_metrics:
                 mtp_brief = (
@@ -2544,6 +2806,7 @@ def main() -> None:
                     f" bgg:{sidecar_metrics.get('toricgt_sidecar/toric_bgg_loss', 0.0):.6f}"
                     f" koszul:{sidecar_metrics.get('toricgt_sidecar/koszul_persistence_loss', 0.0):.6f}"
                     f" cca:{sidecar_metrics.get('toricgt_sidecar/toric_cca_topology_loss', 0.0):.6f}"
+                    f" derived:{sidecar_metrics.get('toricgt_sidecar/derived_signature_loss', 0.0):.6f}"
                 )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
@@ -2553,6 +2816,7 @@ def main() -> None:
                 f"{graph_lm_brief}"
                 f"{teacher_brief}"
                 f"{gflownet_brief}"
+                f"{fot_brief}"
                 f"{mtp_brief}"
                 f"{sidecar_brief}"
             )
@@ -2609,6 +2873,21 @@ def main() -> None:
                 "toricgt_sidecar/toric_bgg_weight": float(args.toric_bgg_loss_weight),
                 "toricgt_sidecar/koszul_persistence_weight": float(args.koszul_persistence_loss_weight),
                 "toricgt_sidecar/combinatorial_toric_weight": float(args.combinatorial_toric_loss_weight),
+                "toricgt_sidecar/derived_signature_weight": float(args.derived_signature_loss_weight),
+                "toricgt_sidecar/advanced_lagrangian_controller_config": float(args.advanced_lagrangian_controller),
+                "toricgt_sidecar/lagrangian_dual_lr_config": float(args.lagrangian_dual_lr),
+                "toricgt_sidecar/lagrangian_decay_config": float(args.lagrangian_decay),
+                "toricgt_sidecar/lagrangian_min_multiplier_config": float(args.lagrangian_min_multiplier),
+                "toricgt_sidecar/lagrangian_max_multiplier_config": float(args.lagrangian_max_multiplier),
+                "toricgt_sidecar/lagrangian_bpb_ceiling_config": float(args.lagrangian_bpb_ceiling),
+                "toricgt_sidecar/toric_fan_curriculum_config": float(args.toric_fan_curriculum),
+                "toricgt_sidecar/toric_fan_coarse_steps_config": float(args.toric_fan_coarse_steps),
+                "toricgt_sidecar/toric_fan_intermediate_steps_config": float(args.toric_fan_intermediate_steps),
+                "toricgt_sidecar/memory_sheaf_gate_min_config": float(args.memory_sheaf_gate_min),
+                "toricgt_sidecar/memory_sheaf_gate_threshold_config": float(args.memory_sheaf_gate_threshold),
+                "toricgt_sidecar/memory_sheaf_gate_softness_config": float(args.memory_sheaf_gate_softness),
+                "toricgt_sidecar/derived_signature_max_vertices_config": float(args.derived_signature_max_vertices),
+                "toricgt_sidecar/derived_signature_max_edges_config": float(args.derived_signature_max_edges),
                 "teacher_distill/configured": float(args.teacher_distill_weight > 0.0 and bool(args.teacher_checkpoint)),
                 "teacher_distill/target_weight": float(args.teacher_distill_weight),
                 "fineweb_caseops/enabled": float(args.fineweb_caseops),
@@ -2623,6 +2902,24 @@ def main() -> None:
                 "oai_gflownet/entropy_weight_config": float(args.oai_gflownet_entropy_weight),
                 "oai_gflownet/every": float(args.oai_gflownet_every),
                 "oai_gflownet/lr": float(args.oai_gflownet_lr),
+                "oai_fot/enabled": float(oai_fot_head is not None),
+                "oai_fot/loss_weight_config": float(args.oai_fot_loss_weight),
+                "oai_fot/every": float(args.oai_fot_every),
+                "oai_fot/lr": float(args.oai_fot_lr),
+                "oai_fot/num_trees_config": float(args.oai_fot_num_trees),
+                "oai_fot/max_depth_config": float(args.oai_fot_max_depth),
+                "oai_fot/branching_config": float(args.oai_fot_branching),
+                "oai_fot/topk_trees_config": float(args.oai_fot_topk_trees),
+                "oai_fot/max_sequences_config": float(args.oai_fot_max_sequences),
+                "oai_fot/max_positions_config": float(args.oai_fot_max_positions),
+                "oai_fot/sparse_weight_config": float(args.oai_fot_sparse_weight),
+                "oai_fot/ucb_weight_config": float(args.oai_fot_ucb_weight),
+                "oai_fot/correction_weight_config": float(args.oai_fot_correction_weight),
+                "oai_fot/consensus_weight_config": float(args.oai_fot_consensus_weight),
+                "oai_fot/tb_weight_config": float(args.oai_fot_tb_weight),
+                "oai_fot/subtb_weight_config": float(args.oai_fot_subtb_weight),
+                "oai_fot/complexity_weight_config": float(args.oai_fot_complexity_weight),
+                "oai_fot/reward_advanced_bonus_config": float(args.oai_fot_reward_advanced_bonus),
                 "oai_mtp/enabled": float(args.oai_mtp),
                 "oai_mtp/loss_weight_config": float(args.oai_mtp_loss_weight),
                 "oai_mtp/every": float(args.oai_mtp_every),
@@ -2631,6 +2928,7 @@ def main() -> None:
             payload.update(graph_lm_metrics)
             payload.update(teacher_metrics)
             payload.update(oai_gflownet_metrics)
+            payload.update(oai_fot_metrics)
             payload.update(oai_mtp_metrics)
             payload.update(sidecar_metrics)
             payload.update(aux_grad_metrics)
