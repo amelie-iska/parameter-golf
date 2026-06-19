@@ -27,6 +27,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from convextok import ConvexTokTokenizer, PRICED_OFFSET
+except Exception:  # pragma: no cover - training paths fail loudly when needed.
+    ConvexTokTokenizer = None  # type: ignore[assignment]
+    PRICED_OFFSET = 260
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -89,6 +95,10 @@ class Hyperparameters:
     tokengt_identifier_weight = float(os.environ.get("TOKENGT_IDENTIFIER_WEIGHT", 0.014))
     tokengt_endpoint_weight = float(os.environ.get("TOKENGT_ENDPOINT_WEIGHT", 0.018))
     tokengt_edge_token_weight = float(os.environ.get("TOKENGT_EDGE_TOKEN_WEIGHT", 0.016))
+    convextok_dag_features = bool(int(os.environ.get("CONVEXTOK_DAG_FEATURES", "1")))
+    convextok_dag_feature_weight = float(os.environ.get("CONVEXTOK_DAG_FEATURE_WEIGHT", 0.018))
+    convextok_toric_reg_weight = float(os.environ.get("CONVEXTOK_TORIC_REG_WEIGHT", "0"))
+    convextok_toric_reg_topk = int(os.environ.get("CONVEXTOK_TORIC_REG_TOPK", "96"))
     graph_output_flattening = bool(
         int(
             os.environ.get(
@@ -441,6 +451,32 @@ def build_sentencepiece_luts(
         torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    )
+
+
+def build_convextok_luts(
+    tok: "ConvexTokTokenizer", vocab_size: int, device: torch.device
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    table_size = max(int(tok.vocab_size), int(vocab_size))
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    lp_scores_np = np.zeros((table_size,), dtype=np.float32)
+    rank_scores_np = np.zeros((table_size,), dtype=np.float32)
+    priced_np = np.zeros((table_size,), dtype=np.float32)
+    lengths = tok.token_byte_lengths()
+    base_bytes_np[: min(table_size, lengths.shape[0])] = lengths[: min(table_size, lengths.shape[0])]
+    lp_scores = tok.token_lp_scores()
+    rank_scores = tok.token_rank_scores()
+    priced = tok.token_is_priced()
+    lp_scores_np[: min(table_size, lp_scores.shape[0])] = lp_scores[: min(table_size, lp_scores.shape[0])]
+    rank_scores_np[: min(table_size, rank_scores.shape[0])] = rank_scores[: min(table_size, rank_scores.shape[0])]
+    priced_np[: min(table_size, priced.shape[0])] = priced[: min(table_size, priced.shape[0])]
+    return (
+        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        torch.zeros((table_size,), dtype=torch.bool, device=device),
+        torch.zeros((table_size,), dtype=torch.bool, device=device),
+        torch.tensor(lp_scores_np, dtype=torch.float32, device=device),
+        torch.tensor(rank_scores_np, dtype=torch.float32, device=device),
+        torch.tensor(priced_np, dtype=torch.float32, device=device),
     )
 
 
@@ -983,6 +1019,7 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         self,
         dim: int,
         *,
+        vocab_size: int,
         token_class_buckets: int,
         position_buckets: int,
         edge_radius: int,
@@ -994,6 +1031,8 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         identifier_weight: float,
         endpoint_weight: float,
         edge_token_weight: float,
+        convextok_dag_features: bool,
+        convextok_dag_feature_weight: float,
         theta: float = 0.6180339887498948,
     ) -> None:
         super().__init__()
@@ -1008,6 +1047,7 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         if identifier_dim <= 0:
             raise ValueError("TOKENGT_IDENTIFIER_DIM must be positive")
         self.dim = int(dim)
+        self.vocab_size = int(vocab_size)
         self.token_class_buckets = int(token_class_buckets)
         self.position_buckets = int(position_buckets)
         self.edge_radius = int(edge_radius)
@@ -1020,6 +1060,8 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         self.identifier_weight = float(identifier_weight)
         self.endpoint_weight = float(endpoint_weight)
         self.edge_token_weight = float(edge_token_weight)
+        self.convextok_dag_features = bool(convextok_dag_features)
+        self.convextok_dag_feature_weight = float(convextok_dag_feature_weight)
         self.theta = float(theta)
         self.token_class_emb = nn.Embedding(self.token_class_buckets, dim)
         self.position_bucket_emb = nn.Embedding(self.position_buckets, dim)
@@ -1034,9 +1076,34 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
         self.identifier_proj = CastedLinear(self.identifier_feature_dim, dim, bias=False)
         self.endpoint_proj = CastedLinear(2 * self.identifier_feature_dim + 1, dim, bias=False)
         self.edge_token_proj = CastedLinear(dim, dim, bias=False)
+        self.convextok_feature_proj = CastedLinear(4, dim, bias=False)
         self.identifier_proj._zero_init = True
         self.endpoint_proj._zero_init = True
         self.edge_token_proj._zero_init = True
+        self.convextok_feature_proj._zero_init = True
+        self.register_buffer("convextok_lp_scores", torch.zeros(self.vocab_size, dtype=torch.float32), persistent=True)
+        self.register_buffer("convextok_rank_scores", torch.zeros(self.vocab_size, dtype=torch.float32), persistent=True)
+        self.register_buffer("convextok_priced_flags", torch.zeros(self.vocab_size, dtype=torch.float32), persistent=True)
+        self.register_buffer("convextok_byte_lengths", torch.zeros(self.vocab_size, dtype=torch.float32), persistent=True)
+
+    def set_convextok_features(
+        self,
+        *,
+        lp_scores: Tensor,
+        rank_scores: Tensor,
+        priced_flags: Tensor,
+        byte_lengths: Tensor,
+    ) -> None:
+        for name, source in (
+            ("convextok_lp_scores", lp_scores),
+            ("convextok_rank_scores", rank_scores),
+            ("convextok_priced_flags", priced_flags),
+            ("convextok_byte_lengths", byte_lengths),
+        ):
+            target = getattr(self, name)
+            n = min(int(target.numel()), int(source.numel()))
+            target.zero_()
+            target[:n].copy_(source[:n].detach().to(device=target.device, dtype=target.dtype))
 
     def _torus_features(self, positions: Tensor, dtype: torch.dtype) -> Tensor:
         pos = positions.to(dtype=torch.float32)
@@ -1122,6 +1189,21 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
             endpoint_context = structural.new_zeros((bsz, seqlen, self.dim))
             edge_token_context = structural.new_zeros((bsz, seqlen, self.dim))
         torus = self.torus_proj(self._torus_features(positions, structural.dtype))
+        if self.convextok_dag_features:
+            ids = input_ids.to(dtype=torch.long).clamp_min(0).clamp_max(self.vocab_size - 1)
+            max_len = self.convextok_byte_lengths.max().clamp_min(1.0)
+            convextok_features = torch.stack(
+                [
+                    self.convextok_lp_scores[ids],
+                    self.convextok_rank_scores[ids],
+                    self.convextok_priced_flags[ids],
+                    self.convextok_byte_lengths[ids] / max_len,
+                ],
+                dim=-1,
+            ).to(dtype=structural.dtype)
+            convextok_context = self.convextok_feature_proj(convextok_features)
+        else:
+            convextok_context = structural.new_zeros((bsz, seqlen, self.dim))
         return (
             float(self.structural_weight) * structural
             + float(self.edge_weight) * edge_context
@@ -1129,6 +1211,7 @@ class FineWebTokenGTStructuralEmbedding(nn.Module):
             + float(self.identifier_weight) * identifier_context
             + float(self.endpoint_weight) * endpoint_context
             + float(self.edge_token_weight) * edge_token_context
+            + float(self.convextok_dag_feature_weight) * convextok_context
         )
 
 
@@ -1374,6 +1457,8 @@ class GPT(nn.Module):
         tokengt_identifier_weight: float,
         tokengt_endpoint_weight: float,
         tokengt_edge_token_weight: float,
+        convextok_dag_features: bool,
+        convextok_dag_feature_weight: float,
         graph_output_flattening: bool,
         graph_output_edge_radius: int,
         graph_output_distance_features: str,
@@ -1397,6 +1482,7 @@ class GPT(nn.Module):
         self.fineweb_tokengt = (
             FineWebTokenGTStructuralEmbedding(
                 model_dim,
+                vocab_size=vocab_size,
                 token_class_buckets=tokengt_token_class_buckets,
                 position_buckets=tokengt_position_buckets,
                 edge_radius=tokengt_graph_radius,
@@ -1408,6 +1494,8 @@ class GPT(nn.Module):
                 identifier_weight=tokengt_identifier_weight,
                 endpoint_weight=tokengt_endpoint_weight,
                 edge_token_weight=tokengt_edge_token_weight,
+                convextok_dag_features=convextok_dag_features,
+                convextok_dag_feature_weight=convextok_dag_feature_weight,
             )
             if self.tokengt_first_class
             else None
@@ -1498,6 +1586,47 @@ class GPT(nn.Module):
     def logits_for_distill(self, input_ids: Tensor, *, flatten_graph_output: bool = True) -> Tensor:
         hidden = self._hidden(input_ids, flatten_graph_output=flatten_graph_output)
         return self._logits_from_hidden(hidden).view(*input_ids.shape, -1)
+
+    def set_convextok_features(
+        self,
+        *,
+        lp_scores: Tensor,
+        rank_scores: Tensor,
+        priced_flags: Tensor,
+        byte_lengths: Tensor,
+    ) -> None:
+        if self.fineweb_tokengt is None:
+            return
+        self.fineweb_tokengt.set_convextok_features(
+            lp_scores=lp_scores,
+            rank_scores=rank_scores,
+            priced_flags=priced_flags,
+            byte_lengths=byte_lengths,
+        )
+
+    def convextok_toric_regularizer(self, *, topk: int = 96) -> Tensor:
+        if self.fineweb_tokengt is None or not self.fineweb_tokengt.convextok_dag_features:
+            return self.tok_emb.weight.float().sum() * 0.0
+        priced = self.fineweb_tokengt.convextok_priced_flags > 0.5
+        lp = self.fineweb_tokengt.convextok_lp_scores.float()
+        candidates = torch.nonzero(priced & (lp > 0), as_tuple=False).flatten()
+        if candidates.numel() < 2:
+            return self.tok_emb.weight.float().sum() * 0.0
+        order = torch.argsort(lp[candidates], descending=True)
+        ids = candidates[order[: max(2, min(int(topk), int(candidates.numel())))]]
+        emb = F.normalize(self.tok_emb.weight[ids].float(), dim=-1)
+        lengths = self.fineweb_tokengt.convextok_byte_lengths[ids].float()
+        max_len = lengths.max().clamp_min(1.0)
+        features = torch.stack(
+            [
+                lp[ids] / lp[ids].max().clamp_min(1e-6),
+                self.fineweb_tokengt.convextok_rank_scores[ids].float(),
+                lengths / max_len,
+            ],
+            dim=-1,
+        )
+        features = F.normalize(features, dim=-1)
+        return F.mse_loss(emb @ emb.T, features @ features.T)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         hidden = self._hidden(input_ids, flatten_graph_output=True)
@@ -1665,22 +1794,50 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+    tokenizer_kind = "sentencepiece"
+    convextok_tokenizer = None
+    convextok_lp_scores = torch.zeros((args.vocab_size,), dtype=torch.float32, device=device)
+    convextok_rank_scores = torch.zeros((args.vocab_size,), dtype=torch.float32, device=device)
+    convextok_priced_flags = torch.zeros((args.vocab_size,), dtype=torch.float32, device=device)
+    if args.tokenizer_path.endswith(".model"):
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
+        caseops_token_map = build_caseops_token_map(sp, args.vocab_size) if args.fineweb_caseops else None
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size, device
         )
-    caseops_token_map = build_caseops_token_map(sp, args.vocab_size) if args.fineweb_caseops else None
+        convextok_byte_lengths = base_bytes_lut.to(dtype=torch.float32)
+    elif args.tokenizer_path.endswith(".convextok.json"):
+        if ConvexTokTokenizer is None:
+            raise RuntimeError("ConvexTok tokenizer support is unavailable; convextok.py import failed")
+        tokenizer_kind = "convextok"
+        convextok_tokenizer = ConvexTokTokenizer.load_json(args.tokenizer_path)
+        if int(convextok_tokenizer.vocab_size) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match ConvexTok vocab_size={int(convextok_tokenizer.vocab_size)}"
+            )
+        if args.fineweb_caseops:
+            raise ValueError("FINEWEB_CASEOPS is SentencePiece-specific and must be disabled for ConvexTok")
+        caseops_token_map = None
+        (
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            convextok_lp_scores,
+            convextok_rank_scores,
+            convextok_priced_flags,
+        ) = build_convextok_luts(convextok_tokenizer, args.vocab_size, device)
+        convextok_byte_lengths = base_bytes_lut.to(dtype=torch.float32)
+    else:
+        raise ValueError(f"Unsupported tokenizer path: {args.tokenizer_path}")
     caseops_pairs = 0 if caseops_token_map is None else int((caseops_token_map != torch.arange(args.vocab_size)).sum().item())
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, token_map=caseops_token_map)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"val_bpb:enabled tokenizer_kind={tokenizer_kind} tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     log0(f"fineweb_caseops:enabled:{int(args.fineweb_caseops)} swapped_token_ids:{caseops_pairs}")
@@ -1714,6 +1871,8 @@ def main() -> None:
         tokengt_identifier_weight=args.tokengt_identifier_weight,
         tokengt_endpoint_weight=args.tokengt_endpoint_weight,
         tokengt_edge_token_weight=args.tokengt_edge_token_weight,
+        convextok_dag_features=args.convextok_dag_features and tokenizer_kind == "convextok",
+        convextok_dag_feature_weight=args.convextok_dag_feature_weight,
         graph_output_flattening=args.graph_output_flattening,
         graph_output_edge_radius=args.graph_output_edge_radius,
         graph_output_distance_features=args.graph_output_distance_features,
@@ -1728,6 +1887,12 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    base_model.set_convextok_features(
+        lp_scores=convextok_lp_scores,
+        rank_scores=convextok_rank_scores,
+        priced_flags=convextok_priced_flags,
+        byte_lengths=convextok_byte_lengths,
+    )
     sidecar = None
     graph_loader = None
     graph_lm_loader = None
@@ -1848,6 +2013,8 @@ def main() -> None:
             tokengt_identifier_weight=args.tokengt_identifier_weight,
             tokengt_endpoint_weight=args.tokengt_endpoint_weight,
             tokengt_edge_token_weight=args.tokengt_edge_token_weight,
+            convextok_dag_features=args.convextok_dag_features and tokenizer_kind == "convextok",
+            convextok_dag_feature_weight=args.convextok_dag_feature_weight,
             graph_output_flattening=args.graph_output_flattening,
             graph_output_edge_radius=args.graph_output_edge_radius,
             graph_output_distance_features=args.graph_output_distance_features,
@@ -2016,6 +2183,8 @@ def main() -> None:
         f"weights:structural={args.tokengt_structural_weight},edge={args.tokengt_edge_weight},"
         f"torus={args.tokengt_torus_weight},identifier={args.tokengt_identifier_weight},"
         f"endpoint={args.tokengt_endpoint_weight},edge_token={args.tokengt_edge_token_weight} "
+        f"convextok_dag_features:{int(args.convextok_dag_features and tokenizer_kind == 'convextok')} "
+        f"convextok_dag_feature_weight:{args.convextok_dag_feature_weight} "
         f"identifier_dim:{args.tokengt_identifier_dim} lr:{args.tokengt_first_class_lr}"
     )
     log0(
@@ -2031,7 +2200,7 @@ def main() -> None:
         f"lr:{args.graph_output_flattening_lr} "
         f"calibration_weight:{args.graph_output_calibration_loss_weight} "
         f"calibration_every:{args.graph_output_calibration_every} "
-        f"flatten_order=sentencepiece_sequence scope=oai_fineweb_bpb_only"
+        f"flatten_order=tokenizer_sequence scope=oai_fineweb_bpb_only"
     )
     log0(
         "graph_lm_primary:"
@@ -2507,6 +2676,7 @@ def main() -> None:
         oai_mtp_metrics: dict[str, float] = {}
         aux_grad_metrics: dict[str, float] = {}
         bpb_aux_metrics: dict[str, float] = {}
+        convextok_metrics: dict[str, float] = {}
         last_fineweb_x: Tensor | None = None
         last_fineweb_y: Tensor | None = None
         flattening_calibration_metrics: dict[str, float] = {}
@@ -2541,6 +2711,20 @@ def main() -> None:
         aux_stage_multiplier = float(bpb_aux_control["stage_multiplier"])
         bpb_aux_metrics = {f"bpb_aux_control/{key}": float(value) for key, value in bpb_aux_control.items()}
         primary_grads = snapshot_base_grads() if args.aux_grad_routing else None
+
+        if tokenizer_kind == "convextok" and args.convextok_toric_reg_weight > 0.0:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
+                convextok_toric_reg = base_model.convextok_toric_regularizer(
+                    topk=max(2, int(args.convextok_toric_reg_topk))
+                )
+                convextok_toric_weight = aux_stage_multiplier * float(args.convextok_toric_reg_weight)
+                weighted_convextok_toric_reg = convextok_toric_weight * convextok_toric_reg
+            weighted_convextok_toric_reg.backward()
+            convextok_metrics = {
+                "convextok_toric/regularizer": float(convextok_toric_reg.detach().float().item()),
+                "convextok_toric/regularizer_weight": float(convextok_toric_weight),
+                "convextok_toric/regularizer_topk": float(args.convextok_toric_reg_topk),
+            }
 
         if (
             oai_gflownet_head is not None
@@ -3026,6 +3210,12 @@ def main() -> None:
                     f" mtp:{oai_mtp_metrics.get('oai_mtp/loss', 0.0):.6f}"
                     f" mtp_w:{oai_mtp_metrics.get('oai_mtp/loss_weight', 0.0):.4f}"
                 )
+            convextok_brief = ""
+            if convextok_metrics:
+                convextok_brief = (
+                    f" convextok_toric:{convextok_metrics.get('convextok_toric/regularizer', 0.0):.6f}"
+                    f" convextok_w:{convextok_metrics.get('convextok_toric/regularizer_weight', 0.0):.6f}"
+                )
             sidecar_brief = ""
             if sidecar_metrics:
                 sidecar_brief = (
@@ -3052,6 +3242,7 @@ def main() -> None:
                 f"{gflownet_brief}"
                 f"{fot_brief}"
                 f"{mtp_brief}"
+                f"{convextok_brief}"
                 f"{sidecar_brief}"
             )
             payload = {
@@ -3075,6 +3266,17 @@ def main() -> None:
                 "fineweb_graphify/endpoint_weight": float(args.tokengt_endpoint_weight),
                 "fineweb_graphify/edge_token_weight": float(args.tokengt_edge_token_weight),
                 "fineweb_graphify/first_class_lr": float(args.tokengt_first_class_lr),
+                "fineweb_graphify/convextok_dag_features": float(args.convextok_dag_features and tokenizer_kind == "convextok"),
+                "fineweb_graphify/convextok_dag_feature_weight": float(args.convextok_dag_feature_weight),
+                "tokenizer/kind_convextok": float(tokenizer_kind == "convextok"),
+                "tokenizer/kind_sentencepiece": float(tokenizer_kind == "sentencepiece"),
+                "tokenizer/priced_offset": float(PRICED_OFFSET),
+                "tokenizer_toric/lp_face_mass": float(convextok_lp_scores.detach().float().sum().item()),
+                "tokenizer_toric/priced_vocab_fraction": float(convextok_priced_flags.detach().float().mean().item()),
+                "tokenizer_toric/mean_token_byte_length": float(convextok_byte_lengths.detach().float().mean().item()),
+                "tokenizer_tropical/mean_token_lp_score": float(convextok_lp_scores.detach().float().mean().item()),
+                "convextok_toric/regularizer_weight_config": float(args.convextok_toric_reg_weight),
+                "convextok_toric/regularizer_topk_config": float(args.convextok_toric_reg_topk),
                 "graph_output_flattening/enabled": float(base_model.graph_output_flattening is not None),
                 "graph_output_flattening/edge_radius": float(args.graph_output_edge_radius),
                 "graph_output_flattening/node_weight": float(args.graph_output_node_weight),
@@ -3176,6 +3378,7 @@ def main() -> None:
                 "oai_mtp/every": float(args.oai_mtp_every),
             }
             payload.update(bpb_aux_metrics)
+            payload.update(convextok_metrics)
             payload.update(flattening_calibration_metrics)
             payload.update(graph_lm_metrics)
             payload.update(teacher_metrics)
