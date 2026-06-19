@@ -158,6 +158,17 @@ class Hyperparameters:
     aux_grad_route_teacher = bool(int(os.environ.get("AUX_GRAD_ROUTE_TEACHER", "1")))
     aux_grad_conflict_projection = bool(int(os.environ.get("AUX_GRAD_CONFLICT_PROJECTION", "1")))
     aux_grad_aligned_boost = float(os.environ.get("AUX_GRAD_ALIGNED_BOOST", 1.0))
+    bpb_first_aux_staging = bool(int(os.environ.get("BPB_FIRST_AUX_STAGING", "1")))
+    bpb_first_core_steps = int(os.environ.get("BPB_FIRST_CORE_STEPS", 250))
+    bpb_first_ramp_steps = int(os.environ.get("BPB_FIRST_RAMP_STEPS", 500))
+    bpb_first_min_aux_mult = float(os.environ.get("BPB_FIRST_MIN_AUX_MULT", 0.02))
+    bpb_first_require_negative_slope = bool(int(os.environ.get("BPB_FIRST_REQUIRE_NEGATIVE_SLOPE", "1")))
+    bpb_first_curvature_guard = bool(int(os.environ.get("BPB_FIRST_CURVATURE_GUARD", "1")))
+    bpb_first_bad_slope_mult = float(os.environ.get("BPB_FIRST_BAD_SLOPE_MULT", 0.25))
+    bpb_first_bad_curvature_mult = float(os.environ.get("BPB_FIRST_BAD_CURVATURE_MULT", 0.35))
+    aux_conflict_controller = bool(int(os.environ.get("AUX_CONFLICT_CONTROLLER", "1")))
+    aux_conflict_damp_min = float(os.environ.get("AUX_CONFLICT_DAMP_MIN", 0.10))
+    aux_conflict_boost_max = float(os.environ.get("AUX_CONFLICT_BOOST_MAX", 1.35))
     teacher_checkpoint = os.environ.get("TEACHER_CHECKPOINT", "")
     teacher_distill_weight = float(os.environ.get("TEACHER_DISTILL_WEIGHT", 0.0))
     teacher_distill_weight_start = float(os.environ.get("TEACHER_DISTILL_WEIGHT_START", teacher_distill_weight))
@@ -203,6 +214,21 @@ class Hyperparameters:
     oai_fot_subtb_weight = float(os.environ.get("OAI_FOT_SUBTB_WEIGHT", 0.0))
     oai_fot_complexity_weight = float(os.environ.get("OAI_FOT_COMPLEXITY_WEIGHT", 0.05))
     oai_fot_reward_advanced_bonus = float(os.environ.get("OAI_FOT_REWARD_ADVANCED_BONUS", 0.0))
+    oai_fot_reward_mode = os.environ.get("OAI_FOT_REWARD_MODE", "bpb_delta")
+    oai_fot_bpb_delta_weight = float(os.environ.get("OAI_FOT_BPB_DELTA_WEIGHT", 1.0))
+    oai_fot_reward_graph_weight = float(os.environ.get("OAI_FOT_REWARD_GRAPH_WEIGHT", 0.10))
+    oai_fot_reward_consensus_weight = float(os.environ.get("OAI_FOT_REWARD_CONSENSUS_WEIGHT", 0.20))
+    oai_fot_reward_complexity_weight = float(os.environ.get("OAI_FOT_REWARD_COMPLEXITY_WEIGHT", 0.02))
+    oai_fot_reward_floor = float(os.environ.get("OAI_FOT_REWARD_FLOOR", 1.0e-4))
+    oai_fot_adaptive_control = bool(int(os.environ.get("OAI_FOT_ADAPTIVE_CONTROL", "1")))
+    oai_fot_reward_target = float(os.environ.get("OAI_FOT_REWARD_TARGET", 0.08))
+    oai_fot_diversity_target = float(os.environ.get("OAI_FOT_DIVERSITY_TARGET", 0.12))
+    oai_fot_entropy_high = float(os.environ.get("OAI_FOT_ENTROPY_HIGH", 0.985))
+    oai_fot_entropy_low = float(os.environ.get("OAI_FOT_ENTROPY_LOW", 0.75))
+    oai_fot_temp_min = float(os.environ.get("OAI_FOT_TEMP_MIN", 0.45))
+    oai_fot_temp_max = float(os.environ.get("OAI_FOT_TEMP_MAX", 1.10))
+    oai_fot_ucb_min = float(os.environ.get("OAI_FOT_UCB_MIN", 0.40))
+    oai_fot_ucb_max = float(os.environ.get("OAI_FOT_UCB_MAX", 1.80))
     oai_mtp = bool(int(os.environ.get("OAI_MTP", "0")))
     oai_mtp_lr = float(os.environ.get("OAI_MTP_LR", tokengt_first_class_lr))
     oai_mtp_every = int(os.environ.get("OAI_MTP_EVERY", 1))
@@ -575,6 +601,22 @@ def count_sentencepiece_target_bytes(
     token_bytes = base_bytes_lut[tgt_flat].to(dtype=torch.int16)
     token_bytes += (has_leading_space_lut[tgt_flat] & ~is_boundary_token_lut[prev_flat]).to(dtype=torch.int16)
     return token_bytes.to(torch.float64).sum()
+
+
+def sentencepiece_target_byte_lengths(
+    previous_ids: Tensor,
+    target_ids: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> Tensor:
+    """Return per-target byte lengths under the validation BPB accounting."""
+
+    prev_flat = previous_ids.reshape(-1)
+    tgt_flat = target_ids.reshape(-1)
+    token_bytes = base_bytes_lut[tgt_flat].to(dtype=torch.int16)
+    token_bytes += (has_leading_space_lut[tgt_flat] & ~is_boundary_token_lut[prev_flat]).to(dtype=torch.int16)
+    return token_bytes.to(dtype=torch.float32).view_as(target_ids).clamp_min(1.0)
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1750,6 +1792,12 @@ def main() -> None:
                 subtb_weight=args.oai_fot_subtb_weight,
                 complexity_weight=args.oai_fot_complexity_weight,
                 reward_advanced_bonus=args.oai_fot_reward_advanced_bonus,
+                reward_mode=args.oai_fot_reward_mode,
+                bpb_delta_weight=args.oai_fot_bpb_delta_weight,
+                reward_graph_weight=args.oai_fot_reward_graph_weight,
+                reward_consensus_weight=args.oai_fot_reward_consensus_weight,
+                reward_complexity_weight=args.oai_fot_reward_complexity_weight,
+                reward_floor=args.oai_fot_reward_floor,
             )
         ).to(device)
     if args.require_toricgt_sidecar and sidecar is None:
@@ -2013,6 +2061,10 @@ def main() -> None:
         f"sidecar:{int(args.aux_grad_route_sidecar)} teacher:{int(args.aux_grad_route_teacher)} "
         f"retrieval_conditioned_aux:{int(args.retrieval_conditioned_aux)} "
         f"uncertainty_weighting:{int(args.sidecar_uncertainty_weighting)} "
+        f"bpb_first_staging:{int(args.bpb_first_aux_staging)} "
+        f"bpb_first_core/ramp/min:{args.bpb_first_core_steps}/{args.bpb_first_ramp_steps}/{args.bpb_first_min_aux_mult} "
+        f"aux_conflict_controller:{int(args.aux_conflict_controller)} "
+        f"aux_conflict_damp/boost:{args.aux_conflict_damp_min}/{args.aux_conflict_boost_max} "
         f"lagrangian_controller:{int(args.advanced_lagrangian_controller)} "
         f"lagrangian_dual_lr:{args.lagrangian_dual_lr} "
         f"lagrangian_bpb_ceiling:{args.lagrangian_bpb_ceiling} "
@@ -2034,6 +2086,10 @@ def main() -> None:
         f"fot_enabled:{int(oai_fot_head is not None)} "
         f"fot_params:{oai_fot_params} "
         f"fot_weight:{args.oai_fot_loss_weight} "
+        f"fot_reward_mode:{args.oai_fot_reward_mode} "
+        f"fot_bpb_delta_weight:{args.oai_fot_bpb_delta_weight} "
+        f"fot_adaptive:{int(args.oai_fot_adaptive_control)} "
+        f"fot_reward/diversity_targets:{args.oai_fot_reward_target}/{args.oai_fot_diversity_target} "
         f"fot_trees:{args.oai_fot_num_trees} "
         f"fot_depth:{args.oai_fot_max_depth} "
         f"fot_branching:{args.oai_fot_branching} "
@@ -2135,6 +2191,13 @@ def main() -> None:
         cosine = dot / (math.sqrt(max(primary_norm_sq, 1e-30)) * math.sqrt(max(aux_norm_sq, 1e-30)))
         conflict = dot < 0.0
         coeff = dot / max(primary_norm_sq, 1e-30) if conflict and args.aux_grad_conflict_projection else 0.0
+        if args.aux_conflict_controller:
+            if conflict:
+                route_scale = max(float(args.aux_conflict_damp_min), 1.0 + min(float(cosine), 0.0))
+            else:
+                route_scale = min(float(args.aux_conflict_boost_max), float(args.aux_grad_aligned_boost) * (1.0 + 0.25 * max(float(cosine), 0.0)))
+        else:
+            route_scale = float(args.aux_grad_aligned_boost)
         routed: list[Tensor | None] = []
         routed_norm_sq_t = torch.zeros((), device=metric_device, dtype=torch.float32)
         for p_grad, a_grad in zip(primary, aux, strict=True):
@@ -2142,9 +2205,9 @@ def main() -> None:
                 routed.append(None)
                 continue
             if conflict and args.aux_grad_conflict_projection and p_grad is not None:
-                r = (a_grad.float() - coeff * p_grad.float()).to(dtype=a_grad.dtype)
+                r = (route_scale * (a_grad.float() - coeff * p_grad.float())).to(dtype=a_grad.dtype)
             else:
-                r = (float(args.aux_grad_aligned_boost) * a_grad.float()).to(dtype=a_grad.dtype)
+                r = (route_scale * a_grad.float()).to(dtype=a_grad.dtype)
             routed_norm_sq_t = routed_norm_sq_t + r.float().pow(2).sum()
             routed.append(r)
         routed_norm_sq = float(routed_norm_sq_t.detach().item())
@@ -2153,6 +2216,8 @@ def main() -> None:
             f"aux_grad_routing/{name}_cosine": float(cosine),
             f"aux_grad_routing/{name}_conflict": float(conflict),
             f"aux_grad_routing/{name}_projection_coeff": float(coeff),
+            f"aux_grad_routing/{name}_route_scale": float(route_scale),
+            f"aux_grad_routing/{name}_controller_enabled": float(args.aux_conflict_controller),
             f"aux_grad_routing/{name}_primary_norm": math.sqrt(max(primary_norm_sq, 0.0)),
             f"aux_grad_routing/{name}_aux_norm": math.sqrt(max(aux_norm_sq, 0.0)),
             f"aux_grad_routing/{name}_routed_norm": math.sqrt(max(routed_norm_sq, 0.0)),
@@ -2206,6 +2271,112 @@ def main() -> None:
         return sorted(set(offsets))
 
     mtp_offsets = parsed_mtp_offsets()
+    bpb_control_state: dict[str, float | None] = {
+        "last_bpb": None,
+        "last_slope": None,
+        "slope_ema": None,
+    }
+    fot_control_state: dict[str, float | None] = {
+        "reward_ema": None,
+        "entropy_ema": None,
+        "diversity_ema": None,
+        "loss_multiplier": 1.0,
+        "temperature_multiplier": 1.0,
+        "ucb_multiplier": 1.0,
+        "sparse_multiplier": 1.0,
+    }
+
+    def update_bpb_aux_control(step_value: int, train_bpb_value: float) -> dict[str, float]:
+        if not args.bpb_first_aux_staging:
+            return {
+                "enabled": 0.0,
+                "stage_multiplier": 1.0,
+                "phase_multiplier": 1.0,
+                "slope_multiplier": 1.0,
+                "curvature_multiplier": 1.0,
+                "slope_ema": 0.0,
+                "curvature": 0.0,
+            }
+        min_mult = max(0.0, min(float(args.bpb_first_min_aux_mult), 1.0))
+        if step_value < int(args.bpb_first_core_steps):
+            phase_multiplier = min_mult
+        else:
+            frac = min(
+                max((step_value - int(args.bpb_first_core_steps)) / max(int(args.bpb_first_ramp_steps), 1), 0.0),
+                1.0,
+            )
+            phase_multiplier = min_mult + frac * (1.0 - min_mult)
+        last_bpb = bpb_control_state.get("last_bpb")
+        current_slope = 0.0 if last_bpb is None else float(train_bpb_value) - float(last_bpb)
+        old_slope_ema = bpb_control_state.get("slope_ema")
+        slope_ema = current_slope if old_slope_ema is None else 0.90 * float(old_slope_ema) + 0.10 * current_slope
+        last_slope = bpb_control_state.get("last_slope")
+        curvature = 0.0 if last_slope is None else slope_ema - float(last_slope)
+        slope_multiplier = 1.0
+        if args.bpb_first_require_negative_slope and step_value > 20 and slope_ema >= 0.0:
+            slope_multiplier = float(args.bpb_first_bad_slope_mult)
+        curvature_multiplier = 1.0
+        if args.bpb_first_curvature_guard and step_value > 40 and curvature > 0.015:
+            curvature_multiplier = float(args.bpb_first_bad_curvature_mult)
+        stage_multiplier = max(0.0, min(1.0, phase_multiplier * slope_multiplier * curvature_multiplier))
+        bpb_control_state["last_bpb"] = float(train_bpb_value)
+        bpb_control_state["last_slope"] = float(slope_ema)
+        bpb_control_state["slope_ema"] = float(slope_ema)
+        return {
+            "enabled": 1.0,
+            "stage_multiplier": float(stage_multiplier),
+            "phase_multiplier": float(phase_multiplier),
+            "slope_multiplier": float(slope_multiplier),
+            "curvature_multiplier": float(curvature_multiplier),
+            "slope_ema": float(1000.0 * slope_ema),
+            "curvature": float(1000.0 * curvature),
+        }
+
+    def current_fot_control() -> dict[str, float]:
+        return {
+            "enabled": float(args.oai_fot_adaptive_control),
+            "loss_multiplier": float(fot_control_state.get("loss_multiplier") or 1.0),
+            "temperature_multiplier": float(fot_control_state.get("temperature_multiplier") or 1.0),
+            "ucb_multiplier": float(fot_control_state.get("ucb_multiplier") or 1.0),
+            "sparse_multiplier": float(fot_control_state.get("sparse_multiplier") or 1.0),
+            "reward_ema": float(fot_control_state.get("reward_ema") or 0.0),
+            "entropy_ema": float(fot_control_state.get("entropy_ema") or 0.0),
+            "diversity_ema": float(fot_control_state.get("diversity_ema") or 0.0),
+        }
+
+    def update_fot_control_from_metrics(metrics: dict[str, float]) -> dict[str, float]:
+        if not args.oai_fot_adaptive_control:
+            return current_fot_control()
+        reward = float(metrics.get("oai_fot/reward_mean", 0.0))
+        entropy = float(metrics.get("oai_fot/activation_entropy", 0.0))
+        diversity = float(metrics.get("oai_fot/tree_diversity", 0.0))
+        for key, value in (("reward_ema", reward), ("entropy_ema", entropy), ("diversity_ema", diversity)):
+            old = fot_control_state.get(key)
+            fot_control_state[key] = value if old is None else 0.85 * float(old) + 0.15 * value
+        reward_ema = float(fot_control_state["reward_ema"] or 0.0)
+        entropy_ema = float(fot_control_state["entropy_ema"] or 0.0)
+        diversity_ema = float(fot_control_state["diversity_ema"] or 0.0)
+        loss_mult = float(fot_control_state.get("loss_multiplier") or 1.0)
+        temp_mult = float(fot_control_state.get("temperature_multiplier") or 1.0)
+        ucb_mult = float(fot_control_state.get("ucb_multiplier") or 1.0)
+        sparse_mult = float(fot_control_state.get("sparse_multiplier") or 1.0)
+        if reward_ema < float(args.oai_fot_reward_target) and entropy_ema > float(args.oai_fot_entropy_high):
+            temp_mult *= 0.96
+            ucb_mult *= 0.96
+            loss_mult *= 0.92
+        if reward_ema >= float(args.oai_fot_reward_target) and diversity_ema < float(args.oai_fot_diversity_target):
+            ucb_mult *= 1.04
+            sparse_mult *= 1.03
+            loss_mult *= 1.02
+        if reward_ema < 0.5 * float(args.oai_fot_reward_target) and diversity_ema < float(args.oai_fot_diversity_target):
+            loss_mult *= 0.88
+        if entropy_ema < float(args.oai_fot_entropy_low) and reward_ema >= 0.75 * float(args.oai_fot_reward_target):
+            temp_mult *= 1.03
+        fot_control_state["loss_multiplier"] = max(0.10, min(1.50, loss_mult))
+        fot_control_state["temperature_multiplier"] = max(float(args.oai_fot_temp_min), min(float(args.oai_fot_temp_max), temp_mult))
+        fot_control_state["ucb_multiplier"] = max(float(args.oai_fot_ucb_min), min(float(args.oai_fot_ucb_max), ucb_mult))
+        fot_control_state["sparse_multiplier"] = max(0.40, min(1.80, sparse_mult))
+        return current_fot_control()
 
     def save_checkpoint(step_value: int, val_loss_value: float | None = None, val_bpb_value: float | None = None) -> None:
         if not master_process or args.checkpoint_every <= 0:
@@ -2335,6 +2506,7 @@ def main() -> None:
         oai_fot_metrics: dict[str, float] = {}
         oai_mtp_metrics: dict[str, float] = {}
         aux_grad_metrics: dict[str, float] = {}
+        bpb_aux_metrics: dict[str, float] = {}
         last_fineweb_x: Tensor | None = None
         last_fineweb_y: Tensor | None = None
         flattening_calibration_metrics: dict[str, float] = {}
@@ -2365,6 +2537,9 @@ def main() -> None:
         train_bits_per_token = float(train_loss.detach().float().item() / math.log(2.0))
         train_tokens_per_byte = float((train_token_count / train_byte_count.clamp_min(1.0)).detach().float().item())
         train_bpb = float(train_bits_per_token * train_tokens_per_byte)
+        bpb_aux_control = update_bpb_aux_control(step, train_bpb)
+        aux_stage_multiplier = float(bpb_aux_control["stage_multiplier"])
+        bpb_aux_metrics = {f"bpb_aux_control/{key}": float(value) for key, value in bpb_aux_control.items()}
         primary_grads = snapshot_base_grads() if args.aux_grad_routing else None
 
         if (
@@ -2389,8 +2564,8 @@ def main() -> None:
                 g_entropy = g_out["oai_gflownet_entropy"].float()
                 g_entropy_objective = (g_entropy - float(args.oai_gflownet_entropy_target)).pow(2)
                 weighted_gflownet_loss = (
-                    float(args.oai_gflownet_loss_weight) * g_out["oai_gflownet_loss"]
-                    + float(args.oai_gflownet_entropy_weight) * g_entropy_objective
+                    aux_stage_multiplier * float(args.oai_gflownet_loss_weight) * g_out["oai_gflownet_loss"]
+                    + aux_stage_multiplier * float(args.oai_gflownet_entropy_weight) * g_entropy_objective
                 )
             if args.aux_grad_routing:
                 saved_base_grads = snapshot_base_grads()
@@ -2407,7 +2582,9 @@ def main() -> None:
                 "oai_gflownet/enabled": 1.0,
                 "oai_gflownet/loss": float(g_out["oai_gflownet_loss"].detach().float().item()),
                 "oai_gflownet/weighted_loss": float(weighted_gflownet_loss.detach().float().item()),
-                "oai_gflownet/loss_weight": float(args.oai_gflownet_loss_weight),
+                "oai_gflownet/loss_weight": float(args.oai_gflownet_loss_weight * aux_stage_multiplier),
+                "oai_gflownet/loss_weight_config": float(args.oai_gflownet_loss_weight),
+                "oai_gflownet/bpb_stage_multiplier": float(aux_stage_multiplier),
                 "oai_gflownet/entropy": float(g_entropy.detach().float().item()),
                 "oai_gflownet/entropy_weight": float(args.oai_gflownet_entropy_weight),
                 "oai_gflownet/entropy_target": float(args.oai_gflownet_entropy_target),
@@ -2445,8 +2622,33 @@ def main() -> None:
                 )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 _, f_hidden, f_nll = base_model.forward_aux(fx, fy, flatten_graph_output=True)
-                f_out = oai_fot_head(f_hidden, fy, f_nll, advanced_signal=advanced_signal)
-                weighted_fot_loss = float(args.oai_fot_loss_weight) * f_out["oai_fot_loss"]
+                f_bytes = sentencepiece_target_byte_lengths(
+                    fx,
+                    fy,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+                fot_control_before = current_fot_control()
+                lm_weight = base_model.tok_emb.weight if base_model.tie_embeddings else base_model.lm_head.weight
+                f_out = oai_fot_head(
+                    f_hidden,
+                    fy,
+                    f_nll,
+                    advanced_signal=advanced_signal,
+                    target_byte_lengths=f_bytes,
+                    lm_head_weight=lm_weight,
+                    logit_softcap=float(args.logit_softcap),
+                    temperature_multiplier=float(fot_control_before["temperature_multiplier"]),
+                    ucb_multiplier=float(fot_control_before["ucb_multiplier"]),
+                    sparse_multiplier=float(fot_control_before["sparse_multiplier"]),
+                )
+                effective_fot_weight = (
+                    aux_stage_multiplier
+                    * float(args.oai_fot_loss_weight)
+                    * float(fot_control_before["loss_multiplier"])
+                )
+                weighted_fot_loss = effective_fot_weight * f_out["oai_fot_loss"]
             if args.aux_grad_routing:
                 saved_base_grads = snapshot_base_grads()
                 zero_base_grads()
@@ -2462,7 +2664,14 @@ def main() -> None:
                 "oai_fot/enabled": 1.0,
                 "oai_fot/loss": float(f_out["oai_fot_loss"].detach().float().item()),
                 "oai_fot/weighted_loss": float(weighted_fot_loss.detach().float().item()),
-                "oai_fot/loss_weight": float(args.oai_fot_loss_weight),
+                "oai_fot/loss_weight": float(effective_fot_weight),
+                "oai_fot/loss_weight_config": float(args.oai_fot_loss_weight),
+                "oai_fot/bpb_stage_multiplier": float(aux_stage_multiplier),
+                "oai_fot/adaptive_control_enabled": float(args.oai_fot_adaptive_control),
+                "oai_fot/runtime_loss_multiplier": float(fot_control_before["loss_multiplier"]),
+                "oai_fot/runtime_temperature_multiplier": float(fot_control_before["temperature_multiplier"]),
+                "oai_fot/runtime_ucb_multiplier": float(fot_control_before["ucb_multiplier"]),
+                "oai_fot/runtime_sparse_multiplier": float(fot_control_before["sparse_multiplier"]),
                 "oai_fot/sparse_activation_loss": float(
                     f_out["oai_fot_sparse_activation_loss"].detach().float().item()
                 ),
@@ -2482,6 +2691,16 @@ def main() -> None:
                 "oai_fot/tree_diversity": float(f_out["oai_fot_tree_diversity"].detach().float().item()),
                 "oai_fot/value_mean": float(f_out["oai_fot_value_mean"].detach().float().item()),
                 "oai_fot/reward_mean": float(f_out["oai_fot_reward_mean"].detach().float().item()),
+                "oai_fot/reward_bpb_delta": float(
+                    f_out["oai_fot_reward_bpb_delta"].detach().float().item()
+                ),
+                "oai_fot/reward_raw_byte_nll": float(
+                    f_out["oai_fot_reward_raw_byte_nll"].detach().float().item()
+                ),
+                "oai_fot/reward_corrected_byte_nll": float(
+                    f_out["oai_fot_reward_corrected_byte_nll"].detach().float().item()
+                ),
+                "oai_fot/corrected_ce": float(f_out["oai_fot_corrected_ce"].detach().float().item()),
                 "oai_fot/tb_residual": float(f_out["oai_fot_tb_residual"].detach().float().item()),
                 "oai_fot/correction_cosine": float(
                     f_out["oai_fot_correction_cosine"].detach().float().item()
@@ -2501,6 +2720,12 @@ def main() -> None:
                 "oai_fot/node_count": float(f_out["oai_fot_node_count"].detach().float().item()),
                 "oai_fot/topk_trees": float(f_out["oai_fot_topk_trees"].detach().float().item()),
             }
+            oai_fot_metrics.update(
+                {
+                    f"oai_fot/runtime_after_{key}": value
+                    for key, value in update_fot_control_from_metrics(oai_fot_metrics).items()
+                }
+            )
 
         if (
             args.oai_mtp
@@ -2525,7 +2750,7 @@ def main() -> None:
                     mtp_logits = base_model._logits_from_hidden(mtp_source)
                     mtp_losses.append(F.cross_entropy(mtp_logits.float(), mtp_target.reshape(-1)))
                 mtp_loss = torch.stack(mtp_losses).mean() if mtp_losses else mtp_hidden.new_zeros(())
-                weighted_mtp_loss = float(args.oai_mtp_loss_weight) * mtp_loss
+                weighted_mtp_loss = aux_stage_multiplier * float(args.oai_mtp_loss_weight) * mtp_loss
             if float(weighted_mtp_loss.detach().float().item()) > 0.0:
                 if args.aux_grad_routing:
                     saved_base_grads = snapshot_base_grads()
@@ -2542,7 +2767,9 @@ def main() -> None:
                 "oai_mtp/enabled": 1.0,
                 "oai_mtp/loss": float(mtp_loss.detach().float().item()),
                 "oai_mtp/weighted_loss": float(weighted_mtp_loss.detach().float().item()),
-                "oai_mtp/loss_weight": float(args.oai_mtp_loss_weight),
+                "oai_mtp/loss_weight": float(args.oai_mtp_loss_weight * aux_stage_multiplier),
+                "oai_mtp/loss_weight_config": float(args.oai_mtp_loss_weight),
+                "oai_mtp/bpb_stage_multiplier": float(aux_stage_multiplier),
                 "oai_mtp/offset_count": float(len(mtp_losses)),
                 "oai_mtp/max_offset": float(max(mtp_offsets) if mtp_offsets else 0),
                 "oai_mtp/sequences": float(seq_count),
@@ -2644,7 +2871,8 @@ def main() -> None:
             gx, gy = graph_lm_loader.next_batch(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 graph_lm_loss, _, _ = base_model.forward_aux(gx, gy)
-                weighted_graph_lm_loss = float(scheduled_graph_lm_weight) * graph_lm_loss
+                effective_graph_lm_weight = aux_stage_multiplier * float(scheduled_graph_lm_weight)
+                weighted_graph_lm_loss = effective_graph_lm_weight * graph_lm_loss
             graph_byte_count = count_sentencepiece_target_bytes(
                 gx,
                 gy,
@@ -2674,7 +2902,9 @@ def main() -> None:
                 "graph_lm_primary/tokens_per_byte": float(graph_tokens_per_byte),
                 "graph_lm_primary/target_tokens": float(gy.numel()),
                 "graph_lm_primary/target_bytes": float(graph_byte_count.detach().float().item()),
-                "graph_lm_primary/loss_weight": float(scheduled_graph_lm_weight),
+                "graph_lm_primary/loss_weight": float(effective_graph_lm_weight),
+                "graph_lm_primary/scheduled_loss_weight": float(scheduled_graph_lm_weight),
+                "graph_lm_primary/bpb_stage_multiplier": float(aux_stage_multiplier),
                 "graph_lm_primary/loss_weight_peak": float(args.graph_lm_loss_weight),
                 "graph_lm_primary/loss_weight_start": float(args.graph_lm_loss_weight_start),
                 "graph_lm_primary/warmup_steps": float(args.graph_lm_warmup_steps),
@@ -2696,7 +2926,8 @@ def main() -> None:
                 sidecar_lm_loss, sidecar_hidden, sidecar_nll = base_model.forward_aux(sx, sy)
                 positions = torch.arange(sx.shape[1], device=device, dtype=torch.float32).unsqueeze(0).expand(sx.shape[0], -1)
                 sidecar_out = sidecar(sidecar_hidden, sy, positions, sidecar_nll, step=step)
-                sidecar_loss = float(scheduled_sidecar_weight) * sidecar_out["toricgt_sidecar_loss"]
+                effective_sidecar_weight = aux_stage_multiplier * float(scheduled_sidecar_weight)
+                sidecar_loss = effective_sidecar_weight * sidecar_out["toricgt_sidecar_loss"]
             if args.aux_grad_routing and args.aux_grad_route_sidecar:
                 saved_base_grads = snapshot_base_grads()
                 zero_base_grads()
@@ -2711,7 +2942,9 @@ def main() -> None:
             sidecar_metrics = {
                 "toricgt_sidecar/lm_loss": float(sidecar_lm_loss.detach().float().item()),
                 "toricgt_sidecar/loss": float(sidecar_loss.detach().float().item()),
-                "toricgt_sidecar/loss_weight": float(scheduled_sidecar_weight),
+                "toricgt_sidecar/loss_weight": float(effective_sidecar_weight),
+                "toricgt_sidecar/scheduled_loss_weight": float(scheduled_sidecar_weight),
+                "toricgt_sidecar/bpb_stage_multiplier": float(aux_stage_multiplier),
                 "toricgt_sidecar/loss_weight_peak": float(args.sidecar_loss_weight),
                 "toricgt_sidecar/loss_weight_start": float(args.sidecar_loss_weight_start),
                 "toricgt_sidecar/warmup_steps": float(args.sidecar_warmup_steps),
@@ -2813,6 +3046,7 @@ def main() -> None:
                 f"train_bpb:{train_bpb:.4f} train_bpt:{train_bits_per_token:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms "
                 f"step_avg:{approx_training_time_ms / max(step - args.start_step, 1):.2f}ms"
+                f" aux_stage:{bpb_aux_metrics.get('bpb_aux_control/stage_multiplier', 1.0):.4f}"
                 f"{graph_lm_brief}"
                 f"{teacher_brief}"
                 f"{gflownet_brief}"
@@ -2897,6 +3131,13 @@ def main() -> None:
                 "score_first_tta/steps": float(args.score_first_tta_steps),
                 "score_first_tta/lr": float(args.score_first_tta_lr),
                 "score_first_tta/commit": float(args.score_first_tta_commit),
+                "bpb_aux_control/staging_enabled_config": float(args.bpb_first_aux_staging),
+                "bpb_aux_control/core_steps_config": float(args.bpb_first_core_steps),
+                "bpb_aux_control/ramp_steps_config": float(args.bpb_first_ramp_steps),
+                "bpb_aux_control/min_aux_mult_config": float(args.bpb_first_min_aux_mult),
+                "aux_grad_routing/conflict_controller_config": float(args.aux_conflict_controller),
+                "aux_grad_routing/conflict_damp_min_config": float(args.aux_conflict_damp_min),
+                "aux_grad_routing/conflict_boost_max_config": float(args.aux_conflict_boost_max),
                 "oai_gflownet/enabled": float(oai_gflownet_head is not None),
                 "oai_gflownet/loss_weight_config": float(args.oai_gflownet_loss_weight),
                 "oai_gflownet/entropy_weight_config": float(args.oai_gflownet_entropy_weight),
@@ -2920,10 +3161,21 @@ def main() -> None:
                 "oai_fot/subtb_weight_config": float(args.oai_fot_subtb_weight),
                 "oai_fot/complexity_weight_config": float(args.oai_fot_complexity_weight),
                 "oai_fot/reward_advanced_bonus_config": float(args.oai_fot_reward_advanced_bonus),
+                "oai_fot/reward_mode_bpb_delta": float(str(args.oai_fot_reward_mode).strip().lower() in {"bpb_delta", "ce_delta", "byte_delta"}),
+                "oai_fot/bpb_delta_weight_config": float(args.oai_fot_bpb_delta_weight),
+                "oai_fot/reward_graph_weight_config": float(args.oai_fot_reward_graph_weight),
+                "oai_fot/reward_consensus_weight_config": float(args.oai_fot_reward_consensus_weight),
+                "oai_fot/reward_complexity_weight_config": float(args.oai_fot_reward_complexity_weight),
+                "oai_fot/adaptive_control_config": float(args.oai_fot_adaptive_control),
+                "oai_fot/reward_target_config": float(args.oai_fot_reward_target),
+                "oai_fot/diversity_target_config": float(args.oai_fot_diversity_target),
+                "oai_fot/entropy_high_config": float(args.oai_fot_entropy_high),
+                "oai_fot/entropy_low_config": float(args.oai_fot_entropy_low),
                 "oai_mtp/enabled": float(args.oai_mtp),
                 "oai_mtp/loss_weight_config": float(args.oai_mtp_loss_weight),
                 "oai_mtp/every": float(args.oai_mtp_every),
             }
+            payload.update(bpb_aux_metrics)
             payload.update(flattening_calibration_metrics)
             payload.update(graph_lm_metrics)
             payload.update(teacher_metrics)
