@@ -51,9 +51,13 @@ class Hyperparameters:
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
-    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
+    # Validation cadence and batch size. Campaign runs can skip the step-0
+    # validation and cap the gate set, while final record runs can leave these
+    # at defaults for full validation.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    eval_initial = bool(int(os.environ.get("EVAL_INITIAL", "1")))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -514,12 +518,34 @@ def apply_token_map(tokens: Tensor, token_map: Tensor | None) -> Tensor:
     return token_map[tokens.to(dtype=torch.long)].to(dtype=tokens.dtype)
 
 
-def load_validation_tokens(pattern: str, seq_len: int, token_map: Tensor | None = None) -> Tensor:
+def load_validation_tokens(
+    pattern: str,
+    seq_len: int,
+    token_map: Tensor | None = None,
+    max_tokens: int = 0,
+) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
-    tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    # The export pipeline writes the fixed first-50k-doc validation set to
+    # fineweb_val_*. Iterative BPB campaigns may use a deterministic prefix
+    # window so validation is frequent enough to guide restarts.
+    if max_tokens > 0:
+        chunks: list[Tensor] = []
+        remaining = max_tokens + 1
+        for file in files:
+            shard = load_data_shard(file)
+            take = min(int(shard.numel()), remaining)
+            if take > 0:
+                chunks.append(shard[:take])
+                remaining -= take
+            if remaining <= 0:
+                break
+        if not chunks:
+            raise ValueError(f"Validation token cap {max_tokens} produced no tokens")
+        tokens = torch.cat(chunks).contiguous()
+    else:
+        tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     tokens = apply_token_map(tokens, token_map)
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
@@ -1840,10 +1866,18 @@ def main() -> None:
     caseops_pairs = 0 if caseops_token_map is None else int((caseops_token_map != torch.arange(args.vocab_size)).sum().item())
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, token_map=caseops_token_map)
+    val_tokens = load_validation_tokens(
+        args.val_files,
+        args.train_seq_len,
+        token_map=caseops_token_map,
+        max_tokens=max(0, int(args.val_max_tokens)),
+    )
     log0(f"val_bpb:enabled tokenizer_kind={tokenizer_kind} tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1} "
+        f"max_tokens:{int(args.val_max_tokens)} eval_initial:{int(args.eval_initial)}"
+    )
     log0(f"fineweb_caseops:enabled:{int(args.fineweb_caseops)} swapped_token_ids:{caseops_pairs}")
 
     # -----------------------------
@@ -2624,7 +2658,9 @@ def main() -> None:
     while True:
         last_step = step >= args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        cadence_validate = args.val_loss_every > 0 and step % args.val_loss_every == 0
+        initial_validate = step == args.start_step
+        should_validate = last_step or (cadence_validate and (args.eval_initial or not initial_validate))
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
