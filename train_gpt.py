@@ -1795,6 +1795,7 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
 
     tokenizer_kind = "sentencepiece"
+    sp = None
     convextok_tokenizer = None
     convextok_lp_scores = torch.zeros((args.vocab_size,), dtype=torch.float32, device=device)
     convextok_rank_scores = torch.zeros((args.vocab_size,), dtype=torch.float32, device=device)
@@ -1833,6 +1834,9 @@ def main() -> None:
         convextok_byte_lengths = base_bytes_lut.to(dtype=torch.float32)
     else:
         raise ValueError(f"Unsupported tokenizer path: {args.tokenizer_path}")
+    graph_text_tokenizer = sp if tokenizer_kind == "sentencepiece" else convextok_tokenizer
+    if graph_text_tokenizer is None:
+        raise RuntimeError(f"No graph text tokenizer initialized for tokenizer_kind={tokenizer_kind}")
     caseops_pairs = 0 if caseops_token_map is None else int((caseops_token_map != torch.arange(args.vocab_size)).sum().item())
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
@@ -1906,7 +1910,7 @@ def main() -> None:
         try:
             graph_lm_loader = GraphParquetTokenStream(
                 args.graph_train_glob,
-                sp,
+                graph_text_tokenizer,
                 args.graph_lm_seq_len,
                 args.graph_lm_batch_size,
             )
@@ -1922,7 +1926,12 @@ def main() -> None:
             raise ValueError("TORICGT_SIDECAR_SEQ_LEN must not exceed TRAIN_SEQ_LEN")
         try:
             sidecar = ToricGTSidecar(args.model_dim, args).to(device)
-            graph_loader = GraphParquetTokenStream(args.graph_train_glob, sp, args.sidecar_seq_len, args.sidecar_batch_size)
+            graph_loader = GraphParquetTokenStream(
+                args.graph_train_glob,
+                graph_text_tokenizer,
+                args.sidecar_seq_len,
+                args.sidecar_batch_size,
+            )
         except Exception:
             if args.require_toricgt_sidecar:
                 raise
