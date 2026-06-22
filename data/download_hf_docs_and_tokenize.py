@@ -1,8 +1,8 @@
 """Download docs_selected.jsonl from Hugging Face and tokenize it locally.
 
-This script is standalone. It does not import any local exporter or tokenizer
-helpers. Tokenizer configs are JSON only and currently support the built-in
-pure-byte and SentencePiece tokenizer definitions in `data/tokenizer_specs.json`.
+This script is standalone. Tokenizer configs are JSON only and currently
+support the built-in pure-byte, SentencePiece, and ConvexTok tokenizer
+definitions. ToricGT uses the ConvexTok path for the graphified OAI baseline.
 """
 
 from __future__ import annotations
@@ -341,6 +341,33 @@ def batched_texts(texts: Iterable[str], batch_size: int):
         yield batch
 
 
+def iter_jsonl_text(path: Path, *, max_docs: int | None = None):
+    with path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if max_docs is not None and i >= max_docs:
+                break
+            payload = json.loads(line)
+            text = clean_source_text(payload.get("text", ""))
+            if text:
+                yield text
+
+
+def load_extra_tokenizer_seed_texts(spec: dict[str, Any]) -> list[str]:
+    seed_path_raw = spec.get("extra_tokenizer_seed_jsonl")
+    if not seed_path_raw:
+        return []
+    seed_path = Path(str(seed_path_raw)).expanduser()
+    if not seed_path.is_absolute():
+        seed_path = (Path(__file__).resolve().parent / seed_path).resolve()
+    if not seed_path.is_file():
+        raise FileNotFoundError(seed_path)
+    max_docs_raw = spec.get("extra_tokenizer_seed_docs")
+    max_docs = None if max_docs_raw is None else int(max_docs_raw)
+    repeat = max(1, int(spec.get("extra_tokenizer_seed_repeat", 1)))
+    seed_texts = list(iter_jsonl_text(seed_path, max_docs=max_docs))
+    return seed_texts * repeat
+
+
 def build_pure_byte_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tokenizers_dir: Path) -> dict[str, Any]:
     del docs_jsonl
     tok = default_pure_byte_tokenizer()
@@ -482,6 +509,12 @@ def build_convextok_tokenizer(
         texts = list(text_iter_factory(train_docs))
     else:
         texts = list(_iter_sentencepiece_text(docs_jsonl, max_docs=train_docs))
+    extra_seed_texts = load_extra_tokenizer_seed_texts(spec)
+    if extra_seed_texts:
+        if bool(spec.get("extra_tokenizer_seed_prepend", True)):
+            texts = extra_seed_texts + texts
+        else:
+            texts = texts + extra_seed_texts
     result = train_convextok(
         texts,
         vocab_size=vocab_size,
@@ -514,6 +547,8 @@ def build_convextok_tokenizer(
             "candidate_count": int(result.candidate_count),
             "sample_doc_count": int(result.sample_doc_count),
             "sample_byte_count": int(result.sample_byte_count),
+            "extra_tokenizer_seed_jsonl": spec.get("extra_tokenizer_seed_jsonl"),
+            "extra_tokenizer_seed_count": len(extra_seed_texts),
         },
     }
 
