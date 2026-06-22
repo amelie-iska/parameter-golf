@@ -155,6 +155,10 @@ class Hyperparameters:
         "/home/iska/Documents/amelie/bio/TropicalGT/TropicalGT-I/data/toricgt/curated_hf_shards",
     )
     graph_train_glob = os.environ.get("GRAPH_TRAIN_GLOB", os.path.join(graph_data_path, "train", "*.parquet"))
+    late_graph_train_glob = os.environ.get("LATE_GRAPH_TRAIN_GLOB", "").strip()
+    late_graph_start_step = int(os.environ.get("LATE_GRAPH_START_STEP", max(1, int(0.70 * iterations))))
+    late_graph_mix_ratio = float(os.environ.get("LATE_GRAPH_MIX_RATIO", "1.0"))
+    late_graph_upsample_passes = int(os.environ.get("LATE_GRAPH_UPSAMPLE_PASSES", "3"))
     graph_lm_primary = bool(int(os.environ.get("GRAPH_LM_PRIMARY", "1" if toricgt_sidecar else "0")))
     require_graph_lm_primary = bool(int(os.environ.get("REQUIRE_GRAPH_LM_PRIMARY", "0")))
     graph_lm_seq_len = int(os.environ.get("GRAPH_LM_SEQ_LEN", train_seq_len))
@@ -335,6 +339,17 @@ class Hyperparameters:
     graphcg_bpb_orthogonal_weight = float(os.environ.get("GRAPHCG_BPB_ORTHOGONAL_WEIGHT", 0.02))
     graphcg_covariance_conflict_damping = float(os.environ.get("GRAPHCG_COVARIANCE_CONFLICT_DAMPING", 0.50))
     cas_toric_ideal_certificate_path = os.environ.get("CAS_TORIC_IDEAL_CERTIFICATE_PATH", "")
+    toricblm_mup = bool(int(os.environ.get("TORICBLM_MUP", "0")))
+    mup_base_shapes = os.environ.get("MUP_BASE_SHAPES", "").strip()
+    mup_width_mult = float(os.environ.get("MUP_WIDTH_MULT", "1.0"))
+    mup_output_mult = float(os.environ.get("MUP_OUTPUT_MULT", "1.0"))
+    mup_attention_scale = bool(int(os.environ.get("MUP_ATTENTION_SCALE", "0")))
+    mup_attention_base_head_dim = float(os.environ.get("MUP_ATTENTION_BASE_HEAD_DIM", "64.0"))
+    mup_rescale_params = bool(int(os.environ.get("MUP_RESCALE_PARAMS", "1")))
+    mup_matrix_lr_scale_power = float(os.environ.get("MUP_MATRIX_LR_SCALE_POWER", "0.0"))
+    mup_scalar_lr_scale_power = float(os.environ.get("MUP_SCALAR_LR_SCALE_POWER", "0.0"))
+    mup_token_lr_scale_power = float(os.environ.get("MUP_TOKEN_LR_SCALE_POWER", "0.0"))
+    mup_aux_lr_scale_power = float(os.environ.get("MUP_AUX_LR_SCALE_POWER", "0.0"))
     checkpoint_every = int(os.environ.get("CHECKPOINT_EVERY", 0))
     checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "checkpoints/parameter_golf_oai_dense")
     resume_checkpoint = os.environ.get("RESUME_CHECKPOINT", "")
@@ -906,7 +921,7 @@ class DistributedTokenLoader:
 
 
 from toricgt.embedding_forest_of_thought import EmbeddingFoTConfig, EmbeddingForestOfThoughtHead
-from toricgt.oai_sidecar import GraphParquetTokenStream, ToricGTSidecar
+from toricgt.oai_sidecar import GraphParquetTokenStream, ScheduledGraphParquetTokenStream, ToricGTSidecar
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -975,6 +990,9 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        *,
+        mup_attention_scale: bool = False,
+        mup_attention_base_head_dim: float = 64.0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -994,6 +1012,8 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.mup_attention_scale = bool(mup_attention_scale)
+        self.mup_attention_base_head_dim = float(mup_attention_base_head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -1006,14 +1026,14 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        sdpa_kwargs = {
+            "attn_mask": None,
+            "is_causal": True,
+            "enable_gqa": (self.num_kv_heads != self.num_heads),
+        }
+        if self.mup_attention_scale:
+            sdpa_kwargs["scale"] = math.sqrt(max(self.mup_attention_base_head_dim, 1.0)) / float(self.head_dim)
+        y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -1437,11 +1457,21 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mup_attention_scale: bool,
+        mup_attention_base_head_dim: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            mup_attention_scale=mup_attention_scale,
+            mup_attention_base_head_dim=mup_attention_base_head_dim,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1494,6 +1524,11 @@ class GPT(nn.Module):
         graph_output_edge_token_weight: float,
         graph_output_score_correction: bool,
         graph_output_score_correction_weight: float,
+        toricblm_mup: bool = False,
+        mup_width_mult: float = 1.0,
+        mup_output_mult: float = 1.0,
+        mup_attention_scale: bool = False,
+        mup_attention_base_head_dim: float = 64.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1501,6 +1536,9 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.toricblm_mup = bool(toricblm_mup)
+        self.mup_width_mult = max(float(mup_width_mult), 1.0e-8)
+        self.mup_output_mult = float(mup_output_mult)
         self.fineweb_graphify = bool(fineweb_graphify)
         self.tokengt_first_class = bool(tokengt_first_class and fineweb_graphify)
         self.graph_output_flattening_enabled = bool(graph_output_flattening and fineweb_graphify)
@@ -1554,6 +1592,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    mup_attention_scale,
+                    mup_attention_base_head_dim,
                 )
                 for i in range(num_layers)
             ]
@@ -1596,10 +1636,14 @@ class GPT(nn.Module):
     def _logits_from_hidden(self, hidden: Tensor) -> Tensor:
         x = hidden.reshape(-1, hidden.size(-1))
         if self.tie_embeddings:
+            if self.toricblm_mup:
+                x = x * (self.mup_output_mult / self.mup_width_mult)
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
+            if self.toricblm_mup:
+                x = x * (self.mup_output_mult / self.mup_width_mult)
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
@@ -1920,6 +1964,11 @@ def main() -> None:
         graph_output_edge_token_weight=args.graph_output_edge_token_weight,
         graph_output_score_correction=args.graph_output_score_correction,
         graph_output_score_correction_weight=args.graph_output_score_correction_weight,
+        toricblm_mup=args.toricblm_mup,
+        mup_width_mult=args.mup_width_mult,
+        mup_output_mult=args.mup_output_mult,
+        mup_attention_scale=args.mup_attention_scale,
+        mup_attention_base_head_dim=args.mup_attention_base_head_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1931,23 +1980,57 @@ def main() -> None:
         priced_flags=convextok_priced_flags,
         byte_lengths=convextok_byte_lengths,
     )
+    mup_applied = False
+    if args.toricblm_mup:
+        if args.mup_base_shapes:
+            repo_root = Path(__file__).resolve().parents[2]
+            mup_path = repo_root / "external" / "mup"
+            if mup_path.exists():
+                sys.path.insert(0, str(mup_path))
+            try:
+                from mup import set_base_shapes
+
+                set_base_shapes(
+                    base_model,
+                    args.mup_base_shapes,
+                    rescale_params=bool(args.mup_rescale_params and not args.resume_checkpoint),
+                )
+                mup_applied = True
+            except Exception as exc:
+                raise RuntimeError(f"TORICBLM_MUP=1 but applying MUP_BASE_SHAPES failed: {exc!r}") from exc
+        else:
+            log0("toricblm_mup:enabled_without_base_shapes width_scaled_readout_and_attention_only")
     sidecar = None
     graph_loader = None
     graph_lm_loader = None
     oai_gflownet_head = None
     oai_fot_head = None
+
+    def build_graph_stream(seq_len: int, batch_size: int):
+        if args.late_graph_train_glob:
+            return ScheduledGraphParquetTokenStream(
+                args.graph_train_glob,
+                args.late_graph_train_glob,
+                graph_text_tokenizer,
+                seq_len,
+                batch_size,
+                late_start_step=args.late_graph_start_step,
+                late_mix_ratio=args.late_graph_mix_ratio,
+            )
+        return GraphParquetTokenStream(
+            args.graph_train_glob,
+            graph_text_tokenizer,
+            seq_len,
+            batch_size,
+        )
+
     if args.graph_lm_primary:
         if args.graph_lm_batch_size < 1:
             raise ValueError("GRAPH_LM_BATCH_SIZE must be at least 1")
         if args.graph_lm_seq_len > args.train_seq_len:
             raise ValueError("GRAPH_LM_SEQ_LEN must not exceed TRAIN_SEQ_LEN")
         try:
-            graph_lm_loader = GraphParquetTokenStream(
-                args.graph_train_glob,
-                graph_text_tokenizer,
-                args.graph_lm_seq_len,
-                args.graph_lm_batch_size,
-            )
+            graph_lm_loader = build_graph_stream(args.graph_lm_seq_len, args.graph_lm_batch_size)
         except Exception:
             if args.require_graph_lm_primary:
                 raise
@@ -1960,12 +2043,7 @@ def main() -> None:
             raise ValueError("TORICGT_SIDECAR_SEQ_LEN must not exceed TRAIN_SEQ_LEN")
         try:
             sidecar = ToricGTSidecar(args.model_dim, args).to(device)
-            graph_loader = GraphParquetTokenStream(
-                args.graph_train_glob,
-                graph_text_tokenizer,
-                args.sidecar_seq_len,
-                args.sidecar_batch_size,
-            )
+            graph_loader = build_graph_stream(args.sidecar_seq_len, args.sidecar_batch_size)
         except Exception:
             if args.require_toricgt_sidecar:
                 raise
@@ -2067,6 +2145,11 @@ def main() -> None:
             graph_output_edge_token_weight=args.graph_output_edge_token_weight,
             graph_output_score_correction=args.graph_output_score_correction,
             graph_output_score_correction_weight=args.graph_output_score_correction_weight,
+            toricblm_mup=args.toricblm_mup,
+            mup_width_mult=args.mup_width_mult,
+            mup_output_mult=args.mup_output_mult,
+            mup_attention_scale=args.mup_attention_scale,
+            mup_attention_base_head_dim=args.mup_attention_base_head_dim,
         ).to(device).bfloat16()
         teacher_payload = torch.load(teacher_path, map_location="cpu", weights_only=False)
         teacher_state = teacher_payload["model"] if isinstance(teacher_payload, dict) and "model" in teacher_payload else teacher_payload
@@ -2108,7 +2191,21 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    width_mult_for_lr = max(float(args.mup_width_mult), 1.0e-8) if args.toricblm_mup else 1.0
+
+    def scaled_lr(base_lr: float, power: float) -> float:
+        return float(base_lr) / (width_mult_for_lr ** float(power))
+
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_lr = scaled_lr(token_lr, args.mup_token_lr_scale_power)
+    matrix_lr = scaled_lr(args.matrix_lr, args.mup_matrix_lr_scale_power)
+    scalar_lr = scaled_lr(args.scalar_lr, args.mup_scalar_lr_scale_power)
+    head_lr = scaled_lr(args.head_lr, args.mup_token_lr_scale_power)
+    tokengt_lr = scaled_lr(args.tokengt_first_class_lr, args.mup_aux_lr_scale_power)
+    flattening_lr = scaled_lr(args.graph_output_flattening_lr, args.mup_aux_lr_scale_power)
+    sidecar_lr = scaled_lr(args.sidecar_lr, args.mup_aux_lr_scale_power)
+    gflownet_lr = scaled_lr(args.oai_gflownet_lr, args.mup_aux_lr_scale_power)
+    fot_lr = scaled_lr(args.oai_fot_lr, args.mup_aux_lr_scale_power)
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -2117,14 +2214,14 @@ def main() -> None:
     )
     optimizer_muon = Muon(
         matrix_params,
-        lr=args.matrix_lr,
+        lr=matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
     for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+        group["base_lr"] = matrix_lr
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        [{"params": scalar_params, "lr": scalar_lr, "base_lr": scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -2145,16 +2242,16 @@ def main() -> None:
         graph_structure_groups.append(
             {
                 "params": first_class_tokengt_params,
-                "lr": args.tokengt_first_class_lr,
-                "base_lr": args.tokengt_first_class_lr,
+                "lr": tokengt_lr,
+                "base_lr": tokengt_lr,
             }
         )
     if graph_output_flattening_params:
         graph_structure_groups.append(
             {
                 "params": graph_output_flattening_params,
-                "lr": args.graph_output_flattening_lr,
-                "base_lr": args.graph_output_flattening_lr,
+                "lr": flattening_lr,
+                "base_lr": flattening_lr,
             }
         )
     if graph_structure_groups:
@@ -2167,7 +2264,7 @@ def main() -> None:
         optimizers.append(optimizer_first_class_tokengt)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": [base_model.lm_head.weight], "lr": head_lr, "base_lr": head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -2175,7 +2272,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
     if sidecar is not None:
         optimizer_sidecar = torch.optim.AdamW(
-            [{"params": list(sidecar.parameters()), "lr": args.sidecar_lr, "base_lr": args.sidecar_lr}],
+            [{"params": list(sidecar.parameters()), "lr": sidecar_lr, "base_lr": sidecar_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -2186,8 +2283,8 @@ def main() -> None:
             [
                 {
                     "params": list(oai_gflownet_head.parameters()),
-                    "lr": args.oai_gflownet_lr,
-                    "base_lr": args.oai_gflownet_lr,
+                    "lr": gflownet_lr,
+                    "base_lr": gflownet_lr,
                 }
             ],
             betas=(args.beta1, args.beta2),
@@ -2200,8 +2297,8 @@ def main() -> None:
             [
                 {
                     "params": list(oai_fot_head.parameters()),
-                    "lr": args.oai_fot_lr,
-                    "base_lr": args.oai_fot_lr,
+                    "lr": fot_lr,
+                    "base_lr": fot_lr,
                 }
             ],
             betas=(args.beta1, args.beta2),
@@ -2218,6 +2315,19 @@ def main() -> None:
     oai_fot_params = sum(p.numel() for p in oai_fot_head.parameters()) if oai_fot_head is not None else 0
     log0(f"model_params:{n_params}")
     log0(
+        "toricblm_mup:"
+        f"enabled:{int(args.toricblm_mup)} base_shapes:{args.mup_base_shapes or 'none'} "
+        f"base_shapes_applied:{int(mup_applied)} width_mult:{args.mup_width_mult} "
+        f"output_mult:{args.mup_output_mult} attention_scale:{int(args.mup_attention_scale)} "
+        f"attention_base_head_dim:{args.mup_attention_base_head_dim} "
+        f"rescale_params:{int(args.mup_rescale_params and not args.resume_checkpoint)} "
+        f"lr_scale_powers:matrix={args.mup_matrix_lr_scale_power},scalar={args.mup_scalar_lr_scale_power},"
+        f"token={args.mup_token_lr_scale_power},aux={args.mup_aux_lr_scale_power} "
+        f"effective_lrs:token={token_lr},matrix={matrix_lr},scalar={scalar_lr},"
+        f"head={head_lr},tokengt={tokengt_lr},flattening={flattening_lr},"
+        f"sidecar={sidecar_lr},gflownet={gflownet_lr},fot={fot_lr}"
+    )
+    log0(
         "fineweb_graphification:"
         f"enabled:{int(args.fineweb_graphify)} tokengt_first_class:{int(args.tokengt_first_class)} "
         f"params:{first_class_tokengt_param_count} radius:{args.tokengt_graph_radius} "
@@ -2228,7 +2338,7 @@ def main() -> None:
         f"endpoint={args.tokengt_endpoint_weight},edge_token={args.tokengt_edge_token_weight} "
         f"convextok_dag_features:{int(args.convextok_dag_features and tokenizer_kind == 'convextok')} "
         f"convextok_dag_feature_weight:{args.convextok_dag_feature_weight} "
-        f"identifier_dim:{args.tokengt_identifier_dim} lr:{args.tokengt_first_class_lr}"
+        f"identifier_dim:{args.tokengt_identifier_dim} lr:{tokengt_lr}"
     )
     log0(
         "graph_output_flattening:"
@@ -2240,7 +2350,7 @@ def main() -> None:
         f"score_correction={args.graph_output_score_correction_weight} "
         f"virtual_edge_tokens:{int(args.graph_output_virtual_edge_tokens)} "
         f"score_correction_enabled:{int(args.graph_output_score_correction)} "
-        f"lr:{args.graph_output_flattening_lr} "
+        f"lr:{flattening_lr} "
         f"calibration_weight:{args.graph_output_calibration_loss_weight} "
         f"calibration_every:{args.graph_output_calibration_every} "
         f"flatten_order=tokenizer_sequence scope=oai_fineweb_bpb_only"
@@ -2252,12 +2362,19 @@ def main() -> None:
         f"loss_weight_start:{args.graph_lm_loss_weight_start} loss_weight_peak:{args.graph_lm_loss_weight} "
         f"warmup_steps:{args.graph_lm_warmup_steps} hold_steps:{args.graph_lm_hold_steps} "
         f"graph_glob:{args.graph_train_glob} "
+        f"late_graph_glob:{args.late_graph_train_glob or 'disabled'} "
+        f"late_start_step:{args.late_graph_start_step} "
+        f"late_mix_ratio:{args.late_graph_mix_ratio} "
+        f"late_upsample_passes:{args.late_graph_upsample_passes} "
         f"stream:{graph_lm_loader.describe() if graph_lm_loader is not None else 'disabled'}"
     )
     log0(
         "toricgt_sidecar:"
         f"enabled:{int(sidecar is not None)} required:{int(args.require_toricgt_sidecar)} "
         f"params:{sidecar_params} graph_glob:{args.graph_train_glob} "
+        f"late_graph_glob:{args.late_graph_train_glob or 'disabled'} "
+        f"late_start_step:{args.late_graph_start_step} "
+        f"late_mix_ratio:{args.late_graph_mix_ratio} "
         f"seq_len:{args.sidecar_seq_len} batch_size:{args.sidecar_batch_size} every:{args.sidecar_every} "
         f"weights:graphcg={args.graphcg_loss_weight},analogy={args.analogy_loss_weight},"
         f"tokengt_graph={args.tokengt_graph_loss_weight},trajectory_memory={args.trajectory_memory_loss_weight},"
@@ -2326,8 +2443,8 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"head_lr:{head_lr if base_model.lm_head is not None else 0.0} "
+        f"matrix_lr:{matrix_lr} scalar_lr:{scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -3097,7 +3214,7 @@ def main() -> None:
             and step % args.graph_lm_every == 0
             and scheduled_graph_lm_weight > 0
         ):
-            gx, gy = graph_lm_loader.next_batch(device)
+            gx, gy = graph_lm_loader.next_batch(device, step=step)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 graph_lm_loss, _, _ = base_model.forward_aux(gx, gy)
                 effective_graph_lm_weight = aux_stage_multiplier * float(scheduled_graph_lm_weight)
@@ -3139,11 +3256,14 @@ def main() -> None:
                 "graph_lm_primary/warmup_steps": float(args.graph_lm_warmup_steps),
                 "graph_lm_primary/seq_len": float(args.graph_lm_seq_len),
                 "graph_lm_primary/batch_size": float(args.graph_lm_batch_size),
+                "graph_lm_primary/late_stage_active": float(
+                    getattr(graph_lm_loader, "last_stream", "base") == "late"
+                ),
             }
 
         if sidecar is not None and graph_loader is not None and args.sidecar_every > 0 and step % args.sidecar_every == 0:
             sidecar.train()
-            sx, sy = graph_loader.next_batch(device)
+            sx, sy = graph_loader.next_batch(device, step=step)
             scheduled_sidecar_weight = linear_schedule(
                 step,
                 args.sidecar_loss_weight_start,
@@ -3178,6 +3298,7 @@ def main() -> None:
                 "toricgt_sidecar/loss_weight_start": float(args.sidecar_loss_weight_start),
                 "toricgt_sidecar/warmup_steps": float(args.sidecar_warmup_steps),
                 "toricgt_sidecar/hold_steps": float(args.sidecar_hold_steps),
+                "toricgt_sidecar/late_stage_active": float(getattr(graph_loader, "last_stream", "base") == "late"),
             }
             for name, value in sidecar_out.items():
                 if torch.is_tensor(value) and value.ndim == 0:
@@ -3342,6 +3463,10 @@ def main() -> None:
                 "graph_lm_primary/every": float(args.graph_lm_every),
                 "graph_lm_primary/loss_weight_peak_config": float(args.graph_lm_loss_weight),
                 "graph_lm_primary/loss_weight_start_config": float(args.graph_lm_loss_weight_start),
+                "graph_lm_primary/late_stage_configured": float(bool(args.late_graph_train_glob)),
+                "graph_lm_primary/late_start_step_config": float(args.late_graph_start_step),
+                "graph_lm_primary/late_mix_ratio_config": float(args.late_graph_mix_ratio),
+                "graph_lm_primary/late_upsample_passes_config": float(args.late_graph_upsample_passes),
                 "toricgt_sidecar/enabled": float(sidecar is not None),
                 "toricgt_sidecar/loss_weight_peak_config": float(args.sidecar_loss_weight),
                 "toricgt_sidecar/loss_weight_start_config": float(args.sidecar_loss_weight_start),
@@ -3421,6 +3546,15 @@ def main() -> None:
                 "oai_mtp/enabled": float(args.oai_mtp),
                 "oai_mtp/loss_weight_config": float(args.oai_mtp_loss_weight),
                 "oai_mtp/every": float(args.oai_mtp_every),
+                "toricblm_mup/enabled": float(args.toricblm_mup),
+                "toricblm_mup/base_shapes_applied": float(mup_applied),
+                "toricblm_mup/width_mult": float(args.mup_width_mult),
+                "toricblm_mup/output_mult": float(args.mup_output_mult),
+                "toricblm_mup/attention_scale": float(args.mup_attention_scale),
+                "toricblm_mup/effective_token_lr": float(token_lr),
+                "toricblm_mup/effective_matrix_lr": float(matrix_lr),
+                "toricblm_mup/effective_scalar_lr": float(scalar_lr),
+                "toricblm_mup/effective_aux_lr": float(sidecar_lr),
             }
             payload.update(bpb_aux_metrics)
             payload.update(convextok_metrics)
