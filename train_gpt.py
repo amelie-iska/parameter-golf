@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
 import math
 import os
 import random
@@ -159,6 +160,13 @@ class Hyperparameters:
     late_graph_start_step = int(os.environ.get("LATE_GRAPH_START_STEP", max(1, int(0.70 * iterations))))
     late_graph_mix_ratio = float(os.environ.get("LATE_GRAPH_MIX_RATIO", "1.0"))
     late_graph_upsample_passes = int(os.environ.get("LATE_GRAPH_UPSAMPLE_PASSES", "3"))
+    toricblm_structure_readiness_manifest = os.environ.get("TORICBLM_STRUCTURE_READINESS_MANIFEST", "").strip()
+    toricblm_structure_flow = bool(int(os.environ.get("TORICBLM_STRUCTURE_FLOW", "0")))
+    toricblm_structure_flow_weight = float(os.environ.get("TORICBLM_STRUCTURE_FLOW_WEIGHT", 0.0))
+    toricblm_structure_contact_weight = float(os.environ.get("TORICBLM_STRUCTURE_CONTACT_WEIGHT", 0.0))
+    toricblm_structure_distogram_weight = float(os.environ.get("TORICBLM_STRUCTURE_DISTOGRAM_WEIGHT", 0.0))
+    toricblm_structure_frame_weight = float(os.environ.get("TORICBLM_STRUCTURE_FRAME_WEIGHT", 0.0))
+    toricblm_structure_flow_start_step = int(os.environ.get("TORICBLM_STRUCTURE_FM_START_STEP", late_graph_start_step))
     graph_lm_primary = bool(int(os.environ.get("GRAPH_LM_PRIMARY", "1" if toricgt_sidecar else "0")))
     require_graph_lm_primary = bool(int(os.environ.get("REQUIRE_GRAPH_LM_PRIMARY", "0")))
     graph_lm_seq_len = int(os.environ.get("GRAPH_LM_SEQ_LEN", train_seq_len))
@@ -1813,6 +1821,17 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    structure_readiness: dict[str, object] = {}
+    if args.toricblm_structure_readiness_manifest:
+        manifest_path = Path(args.toricblm_structure_readiness_manifest)
+        if manifest_path.exists():
+            try:
+                structure_readiness = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                log0(f"toricblm_structure_readiness:load_failed path:{manifest_path} error:{exc!r}")
+        else:
+            log0(f"toricblm_structure_readiness:missing_manifest path:{manifest_path}")
+
     wandb_run = None
     if master_process and os.environ.get("WANDB_PROJECT"):
         try:
@@ -2367,6 +2386,19 @@ def main() -> None:
         f"late_mix_ratio:{args.late_graph_mix_ratio} "
         f"late_upsample_passes:{args.late_graph_upsample_passes} "
         f"stream:{graph_lm_loader.describe() if graph_lm_loader is not None else 'disabled'}"
+    )
+    log0(
+        "toricblm_structure_training:"
+        f"flow_enabled:{int(args.toricblm_structure_flow)} "
+        f"flow_weight:{args.toricblm_structure_flow_weight} "
+        f"contact_weight:{args.toricblm_structure_contact_weight} "
+        f"distogram_weight:{args.toricblm_structure_distogram_weight} "
+        f"frame_weight:{args.toricblm_structure_frame_weight} "
+        f"start_step:{args.toricblm_structure_flow_start_step} "
+        f"readiness_manifest:{args.toricblm_structure_readiness_manifest or 'none'} "
+        f"coordinate_records:{int(structure_readiness.get('coordinate_bearing_records', 0) or 0)} "
+        f"association_records:{int(structure_readiness.get('structure_association_records', 0) or 0)} "
+        f"status:{structure_readiness.get('structure_flow_status', 'unknown')}"
     )
     log0(
         "toricgt_sidecar:"
@@ -3467,6 +3499,23 @@ def main() -> None:
                 "graph_lm_primary/late_start_step_config": float(args.late_graph_start_step),
                 "graph_lm_primary/late_mix_ratio_config": float(args.late_graph_mix_ratio),
                 "graph_lm_primary/late_upsample_passes_config": float(args.late_graph_upsample_passes),
+                "toricblm_structure/flow_enabled_config": float(args.toricblm_structure_flow),
+                "toricblm_structure/flow_weight_config": float(args.toricblm_structure_flow_weight),
+                "toricblm_structure/contact_weight_config": float(args.toricblm_structure_contact_weight),
+                "toricblm_structure/distogram_weight_config": float(args.toricblm_structure_distogram_weight),
+                "toricblm_structure/frame_weight_config": float(args.toricblm_structure_frame_weight),
+                "toricblm_structure/start_step_config": float(args.toricblm_structure_flow_start_step),
+                "toricblm_structure/coordinate_bearing_records": float(
+                    structure_readiness.get("coordinate_bearing_records", 0) or 0
+                ),
+                "toricblm_structure/structure_association_records": float(
+                    structure_readiness.get("structure_association_records", 0) or 0
+                ),
+                "toricblm_structure/readiness_records": float(structure_readiness.get("records", 0) or 0),
+                "toricblm_structure/coordinate_losses_active": float(
+                    args.toricblm_structure_flow
+                    and (structure_readiness.get("coordinate_bearing_records", 0) or 0) > 0
+                ),
                 "toricgt_sidecar/enabled": float(sidecar is not None),
                 "toricgt_sidecar/loss_weight_peak_config": float(args.sidecar_loss_weight),
                 "toricgt_sidecar/loss_weight_start_config": float(args.sidecar_loss_weight_start),
