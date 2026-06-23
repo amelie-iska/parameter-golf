@@ -162,6 +162,13 @@ class Hyperparameters:
     late_graph_upsample_passes = int(os.environ.get("LATE_GRAPH_UPSAMPLE_PASSES", "3"))
     toricblm_structure_readiness_manifest = os.environ.get("TORICBLM_STRUCTURE_READINESS_MANIFEST", "").strip()
     toricblm_structure_flow = bool(int(os.environ.get("TORICBLM_STRUCTURE_FLOW", "0")))
+    toricblm_structure_train_glob = os.environ.get("TORICBLM_STRUCTURE_TRAIN_GLOB", "").strip()
+    toricblm_structure_seq_len = int(os.environ.get("TORICBLM_STRUCTURE_SEQ_LEN", min(train_seq_len, 512)))
+    toricblm_structure_batch_size = int(os.environ.get("TORICBLM_STRUCTURE_BATCH_SIZE", "2"))
+    toricblm_structure_every = int(os.environ.get("TORICBLM_STRUCTURE_EVERY", "4"))
+    toricblm_structure_max_atoms = int(os.environ.get("TORICBLM_STRUCTURE_MAX_ATOMS", "128"))
+    toricblm_structure_head_hidden_dim = int(os.environ.get("TORICBLM_STRUCTURE_HEAD_HIDDEN_DIM", "512"))
+    toricblm_structure_lr = float(os.environ.get("TORICBLM_STRUCTURE_LR", "0.00012"))
     toricblm_structure_flow_weight = float(os.environ.get("TORICBLM_STRUCTURE_FLOW_WEIGHT", 0.0))
     toricblm_structure_contact_weight = float(os.environ.get("TORICBLM_STRUCTURE_CONTACT_WEIGHT", 0.0))
     toricblm_structure_distogram_weight = float(os.environ.get("TORICBLM_STRUCTURE_DISTOGRAM_WEIGHT", 0.0))
@@ -182,6 +189,7 @@ class Hyperparameters:
     aux_grad_route_graph_lm = bool(int(os.environ.get("AUX_GRAD_ROUTE_GRAPH_LM", "1")))
     aux_grad_route_sidecar = bool(int(os.environ.get("AUX_GRAD_ROUTE_SIDECAR", "1")))
     aux_grad_route_teacher = bool(int(os.environ.get("AUX_GRAD_ROUTE_TEACHER", "1")))
+    aux_grad_route_structure = bool(int(os.environ.get("AUX_GRAD_ROUTE_STRUCTURE", "1")))
     aux_grad_conflict_projection = bool(int(os.environ.get("AUX_GRAD_CONFLICT_PROJECTION", "1")))
     aux_grad_aligned_boost = float(os.environ.get("AUX_GRAD_ALIGNED_BOOST", 1.0))
     bpb_first_aux_staging = bool(int(os.environ.get("BPB_FIRST_AUX_STAGING", "1")))
@@ -929,7 +937,13 @@ class DistributedTokenLoader:
 
 
 from toricgt.embedding_forest_of_thought import EmbeddingFoTConfig, EmbeddingForestOfThoughtHead
-from toricgt.oai_sidecar import GraphParquetTokenStream, ScheduledGraphParquetTokenStream, ToricGTSidecar
+from toricgt.oai_sidecar import (
+    GraphParquetTokenStream,
+    ScheduledGraphParquetTokenStream,
+    StructureCoordinateParquetStream,
+    ToricGTSidecar,
+)
+from toricgt.structure_flow_matching import structure_flow_loss
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1453,6 +1467,94 @@ class OAIEmbeddingGFlowNetHead(nn.Module):
             "oai_gflownet_reward_mean": reward.detach().mean(),
             "oai_gflownet_score_gap": score_gap.detach(),
             "oai_gflownet_log_z": self.log_z.detach(),
+        }
+
+
+class OAIStructureCoordinateHead(nn.Module):
+    """Training-only coordinate head for real AFDB/PDB structure records."""
+
+    def __init__(self, dim: int, *, hidden_dim: int, distogram_bins: int = 32) -> None:
+        super().__init__()
+        self.distogram_bins = int(distogram_bins)
+        self.dim = int(dim)
+        self.velocity = nn.Sequential(
+            RMSNorm(),
+            CastedLinear(dim, hidden_dim),
+            nn.GELU(),
+            CastedLinear(hidden_dim, 3),
+        )
+        self.contact_proj = nn.Sequential(
+            RMSNorm(),
+            CastedLinear(dim, max(32, hidden_dim // 4)),
+            nn.GELU(),
+        )
+        self.dist_pair = nn.Sequential(
+            CastedLinear(2 * dim, hidden_dim),
+            nn.GELU(),
+            CastedLinear(hidden_dim, self.distogram_bins),
+        )
+
+    def forward(
+        self,
+        hidden: Tensor,
+        target_coords: Tensor,
+        coord_mask: Tensor,
+        *,
+        flow_weight: float,
+        contact_weight: float,
+        distogram_weight: float,
+        noise_scale: float = 0.15,
+    ) -> dict[str, Tensor]:
+        max_atoms = min(int(target_coords.shape[1]), int(hidden.shape[1]))
+        h = hidden[:, :max_atoms, :]
+        coords = target_coords[:, :max_atoms, :].float()
+        mask = coord_mask[:, :max_atoms].bool()
+        if not bool(mask.any()):
+            zero = hidden.float().sum() * 0.0
+            return {
+                "structure_loss": zero,
+                "flow_matching_loss": zero.detach(),
+                "contact_bce_loss": zero.detach(),
+                "distogram_loss": zero.detach(),
+                "rmsd": zero.detach(),
+                "coordinate_count": zero.detach(),
+            }
+        # Center coordinates per structure for stable prediction, but keep the
+        # geometry real: targets are AFDB/PDB coordinates after translation only.
+        atom_mask = mask.unsqueeze(-1).float()
+        center = (coords * atom_mask).sum(dim=1, keepdim=True) / atom_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        coords = coords - center
+        noise = torch.randn_like(coords) * float(noise_scale)
+        noisy = coords + noise * atom_mask
+        pred_velocity = self.velocity(h).float()
+        contact_features = self.contact_proj(h).float()
+        contact_logits = torch.matmul(contact_features, contact_features.transpose(1, 2)) / math.sqrt(
+            max(1, contact_features.shape[-1])
+        )
+        hi = h[:, :, None, :].float().expand(-1, -1, max_atoms, -1)
+        hj = h[:, None, :, :].float().expand(-1, max_atoms, -1, -1)
+        pair_features = torch.cat([hi - hj, hi * hj], dim=-1)
+        distogram_logits = self.dist_pair(pair_features)
+        bin_edges = torch.linspace(2.0, 32.0, self.distogram_bins + 1, device=hidden.device, dtype=torch.float32)
+        metrics = structure_flow_loss(
+            pred_velocity=pred_velocity,
+            noisy_coords=noisy,
+            target_coords=coords,
+            mask=mask,
+            pred_contact_logits=contact_logits,
+            pred_distogram_logits=distogram_logits,
+            distogram_bin_edges=bin_edges,
+            flow_weight=float(flow_weight),
+            contact_weight=float(contact_weight),
+            distogram_weight=float(distogram_weight),
+        )
+        return {
+            "structure_loss": metrics.loss,
+            "flow_matching_loss": metrics.flow_matching_loss.detach(),
+            "contact_bce_loss": metrics.contact_bce_loss.detach(),
+            "distogram_loss": metrics.distogram_loss.detach(),
+            "rmsd": metrics.rmsd.detach(),
+            "coordinate_count": metrics.coordinate_count.detach(),
         }
 
 
@@ -2024,6 +2126,8 @@ def main() -> None:
     graph_lm_loader = None
     oai_gflownet_head = None
     oai_fot_head = None
+    structure_loader = None
+    structure_head = None
 
     def build_graph_stream(seq_len: int, batch_size: int):
         if args.late_graph_train_glob:
@@ -2104,6 +2208,20 @@ def main() -> None:
                 reward_complexity_weight=args.oai_fot_reward_complexity_weight,
                 reward_floor=args.oai_fot_reward_floor,
             )
+        ).to(device)
+    if args.toricblm_structure_flow and args.toricblm_structure_train_glob:
+        if args.toricblm_structure_seq_len > args.train_seq_len:
+            raise ValueError("TORICBLM_STRUCTURE_SEQ_LEN must not exceed TRAIN_SEQ_LEN")
+        structure_loader = StructureCoordinateParquetStream(
+            args.toricblm_structure_train_glob,
+            graph_text_tokenizer,
+            args.toricblm_structure_seq_len,
+            args.toricblm_structure_batch_size,
+            max_atoms=args.toricblm_structure_max_atoms,
+        )
+        structure_head = OAIStructureCoordinateHead(
+            args.model_dim,
+            hidden_dim=args.toricblm_structure_head_hidden_dim,
         ).to(device)
     if args.require_toricgt_sidecar and sidecar is None:
         raise RuntimeError("REQUIRE_TORICGT_SIDECAR=1 but the ToricGT sidecar is disabled")
@@ -2225,6 +2343,7 @@ def main() -> None:
     sidecar_lr = scaled_lr(args.sidecar_lr, args.mup_aux_lr_scale_power)
     gflownet_lr = scaled_lr(args.oai_gflownet_lr, args.mup_aux_lr_scale_power)
     fot_lr = scaled_lr(args.oai_fot_lr, args.mup_aux_lr_scale_power)
+    structure_lr = scaled_lr(args.toricblm_structure_lr, args.mup_aux_lr_scale_power)
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -2325,6 +2444,20 @@ def main() -> None:
             fused=True,
         )
         optimizers.append(optimizer_oai_fot)
+    if structure_head is not None:
+        optimizer_structure = torch.optim.AdamW(
+            [
+                {
+                    "params": list(structure_head.parameters()),
+                    "lr": structure_lr,
+                    "base_lr": structure_lr,
+                }
+            ],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_structure)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     first_class_tokengt_param_count = sum(p.numel() for p in first_class_tokengt_params)
@@ -2332,6 +2465,7 @@ def main() -> None:
     sidecar_params = sum(p.numel() for p in sidecar.parameters()) if sidecar is not None else 0
     oai_gflownet_params = sum(p.numel() for p in oai_gflownet_head.parameters()) if oai_gflownet_head is not None else 0
     oai_fot_params = sum(p.numel() for p in oai_fot_head.parameters()) if oai_fot_head is not None else 0
+    structure_head_params = sum(p.numel() for p in structure_head.parameters()) if structure_head is not None else 0
     log0(f"model_params:{n_params}")
     log0(
         "toricblm_mup:"
@@ -2344,7 +2478,7 @@ def main() -> None:
         f"token={args.mup_token_lr_scale_power},aux={args.mup_aux_lr_scale_power} "
         f"effective_lrs:token={token_lr},matrix={matrix_lr},scalar={scalar_lr},"
         f"head={head_lr},tokengt={tokengt_lr},flattening={flattening_lr},"
-        f"sidecar={sidecar_lr},gflownet={gflownet_lr},fot={fot_lr}"
+        f"sidecar={sidecar_lr},gflownet={gflownet_lr},fot={fot_lr},structure={structure_lr}"
     )
     log0(
         "fineweb_graphification:"
@@ -2390,6 +2524,15 @@ def main() -> None:
     log0(
         "toricblm_structure_training:"
         f"flow_enabled:{int(args.toricblm_structure_flow)} "
+        f"head_enabled:{int(structure_head is not None)} "
+        f"params:{structure_head_params} "
+        f"train_glob:{args.toricblm_structure_train_glob or 'disabled'} "
+        f"stream:{structure_loader.describe() if structure_loader is not None else 'disabled'} "
+        f"seq_len:{args.toricblm_structure_seq_len} "
+        f"batch_size:{args.toricblm_structure_batch_size} "
+        f"every:{args.toricblm_structure_every} "
+        f"max_atoms:{args.toricblm_structure_max_atoms} "
+        f"lr:{structure_lr} "
         f"flow_weight:{args.toricblm_structure_flow_weight} "
         f"contact_weight:{args.toricblm_structure_contact_weight} "
         f"distogram_weight:{args.toricblm_structure_distogram_weight} "
@@ -2868,6 +3011,7 @@ def main() -> None:
         oai_gflownet_metrics: dict[str, float] = {}
         oai_fot_metrics: dict[str, float] = {}
         oai_mtp_metrics: dict[str, float] = {}
+        structure_metrics: dict[str, float] = {}
         aux_grad_metrics: dict[str, float] = {}
         bpb_aux_metrics: dict[str, float] = {}
         convextok_metrics: dict[str, float] = {}
@@ -3293,6 +3437,75 @@ def main() -> None:
                 ),
             }
 
+        if (
+            structure_loader is not None
+            and structure_head is not None
+            and args.toricblm_structure_flow
+            and args.toricblm_structure_every > 0
+            and step >= args.toricblm_structure_flow_start_step
+            and step % args.toricblm_structure_every == 0
+            and (
+                args.toricblm_structure_flow_weight
+                + args.toricblm_structure_contact_weight
+                + args.toricblm_structure_distogram_weight
+            )
+            > 0.0
+        ):
+            sx, sy, target_coords, coord_mask, plddt = structure_loader.next_batch(device, step=step)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                structure_lm_loss, structure_hidden, _structure_nll = base_model.forward_aux(
+                    sx,
+                    sy,
+                    flatten_graph_output=False,
+                )
+                structure_out = structure_head(
+                    structure_hidden,
+                    target_coords,
+                    coord_mask,
+                    flow_weight=float(args.toricblm_structure_flow_weight),
+                    contact_weight=float(args.toricblm_structure_contact_weight),
+                    distogram_weight=float(args.toricblm_structure_distogram_weight),
+                )
+                weighted_structure_loss = aux_stage_multiplier * structure_out["structure_loss"]
+            if args.aux_grad_routing and args.aux_grad_route_structure:
+                saved_base_grads = snapshot_base_grads()
+                zero_base_grads()
+                weighted_structure_loss.backward()
+                aux = snapshot_base_grads()
+                routed, metrics = route_aux_grads(primary_grads, aux, name="structure")
+                restore_base_grads(saved_base_grads)
+                add_base_grads(routed)
+                aux_grad_metrics.update(metrics)
+            else:
+                weighted_structure_loss.backward()
+            structure_metrics = {
+                "toricblm_structure/head_enabled": 1.0,
+                "toricblm_structure/coordinate_losses_active": 1.0,
+                "toricblm_structure/lm_loss": float(structure_lm_loss.detach().float().item()),
+                "toricblm_structure/loss": float(structure_out["structure_loss"].detach().float().item()),
+                "toricblm_structure/weighted_loss": float(weighted_structure_loss.detach().float().item()),
+                "toricblm_structure/flow_matching_loss": float(
+                    structure_out["flow_matching_loss"].detach().float().item()
+                ),
+                "toricblm_structure/contact_bce_loss": float(
+                    structure_out["contact_bce_loss"].detach().float().item()
+                ),
+                "toricblm_structure/distogram_loss": float(
+                    structure_out["distogram_loss"].detach().float().item()
+                ),
+                "toricblm_structure/rmsd": float(structure_out["rmsd"].detach().float().item()),
+                "toricblm_structure/coordinate_count_batch": float(
+                    structure_out["coordinate_count"].detach().float().item()
+                ),
+                "toricblm_structure/batch_size": float(args.toricblm_structure_batch_size),
+                "toricblm_structure/max_atoms": float(args.toricblm_structure_max_atoms),
+                "toricblm_structure/every": float(args.toricblm_structure_every),
+                "toricblm_structure/bpb_stage_multiplier": float(aux_stage_multiplier),
+                "toricblm_structure/mean_plddt_batch": float(
+                    plddt[coord_mask].detach().float().mean().item() if bool(coord_mask.any()) else 0.0
+                ),
+            }
+
         if sidecar is not None and graph_loader is not None and args.sidecar_every > 0 and step % args.sidecar_every == 0:
             sidecar.train()
             sx, sy = graph_loader.next_batch(device, step=step)
@@ -3414,6 +3627,13 @@ def main() -> None:
                     f" convextok_toric:{convextok_metrics.get('convextok_toric/regularizer', 0.0):.6f}"
                     f" convextok_w:{convextok_metrics.get('convextok_toric/regularizer_weight', 0.0):.6f}"
                 )
+            structure_brief = ""
+            if structure_metrics:
+                structure_brief = (
+                    f" structure_loss:{structure_metrics.get('toricblm_structure/loss', 0.0):.6f}"
+                    f" structure_rmsd:{structure_metrics.get('toricblm_structure/rmsd', 0.0):.4f}"
+                    f" structure_coords:{structure_metrics.get('toricblm_structure/coordinate_count_batch', 0.0):.0f}"
+                )
             sidecar_brief = ""
             if sidecar_metrics:
                 sidecar_brief = (
@@ -3441,6 +3661,7 @@ def main() -> None:
                 f"{fot_brief}"
                 f"{mtp_brief}"
                 f"{convextok_brief}"
+                f"{structure_brief}"
                 f"{sidecar_brief}"
             )
             payload = {
@@ -3500,6 +3721,13 @@ def main() -> None:
                 "graph_lm_primary/late_mix_ratio_config": float(args.late_graph_mix_ratio),
                 "graph_lm_primary/late_upsample_passes_config": float(args.late_graph_upsample_passes),
                 "toricblm_structure/flow_enabled_config": float(args.toricblm_structure_flow),
+                "toricblm_structure/head_enabled_config": float(structure_head is not None),
+                "toricblm_structure/train_glob_configured": float(bool(args.toricblm_structure_train_glob)),
+                "toricblm_structure/every_config": float(args.toricblm_structure_every),
+                "toricblm_structure/max_atoms_config": float(args.toricblm_structure_max_atoms),
+                "toricblm_structure/batch_size_config": float(args.toricblm_structure_batch_size),
+                "toricblm_structure/seq_len_config": float(args.toricblm_structure_seq_len),
+                "toricblm_structure/lr_config": float(args.toricblm_structure_lr),
                 "toricblm_structure/flow_weight_config": float(args.toricblm_structure_flow_weight),
                 "toricblm_structure/contact_weight_config": float(args.toricblm_structure_contact_weight),
                 "toricblm_structure/distogram_weight_config": float(args.toricblm_structure_distogram_weight),
@@ -3513,8 +3741,7 @@ def main() -> None:
                 ),
                 "toricblm_structure/readiness_records": float(structure_readiness.get("records", 0) or 0),
                 "toricblm_structure/coordinate_losses_active": float(
-                    args.toricblm_structure_flow
-                    and (structure_readiness.get("coordinate_bearing_records", 0) or 0) > 0
+                    args.toricblm_structure_flow and structure_loader is not None and structure_head is not None
                 ),
                 "toricgt_sidecar/enabled": float(sidecar is not None),
                 "toricgt_sidecar/loss_weight_peak_config": float(args.sidecar_loss_weight),
@@ -3613,6 +3840,7 @@ def main() -> None:
             payload.update(oai_gflownet_metrics)
             payload.update(oai_fot_metrics)
             payload.update(oai_mtp_metrics)
+            payload.update(structure_metrics)
             payload.update(sidecar_metrics)
             payload.update(aux_grad_metrics)
             wandb_log0(payload, step)
