@@ -205,6 +205,9 @@ class Hyperparameters:
     long_entry_next_segment_weight = float(os.environ.get("LONG_ENTRY_NEXT_SEGMENT_WEIGHT", "0.010"))
     long_entry_boundary_weight = float(os.environ.get("LONG_ENTRY_BOUNDARY_WEIGHT", "0.004"))
     long_entry_segment_coverage_weight = float(os.environ.get("LONG_ENTRY_SEGMENT_COVERAGE_WEIGHT", "0.002"))
+    long_entry_fot_loss_weight = float(os.environ.get("LONG_ENTRY_FOT_LOSS_WEIGHT", "0.0"))
+    long_entry_fot_every = int(os.environ.get("LONG_ENTRY_FOT_EVERY", os.environ.get("LONG_ENTRY_EVERY", "8")))
+    long_entry_fot_max_segments = int(os.environ.get("LONG_ENTRY_FOT_MAX_SEGMENTS", "2"))
     long_entry_full_context_every = int(os.environ.get("LONG_ENTRY_FULL_CONTEXT_EVERY", "64"))
     long_entry_full_context_seq_len = int(os.environ.get("LONG_ENTRY_FULL_CONTEXT_SEQ_LEN", "8192"))
     long_entry_full_context_loss_weight = float(os.environ.get("LONG_ENTRY_FULL_CONTEXT_LOSS_WEIGHT", "0.006"))
@@ -2000,6 +2003,13 @@ def main() -> None:
                 log0(f"toricblm_structure_readiness:load_failed path:{manifest_path} error:{exc!r}")
         else:
             log0(f"toricblm_structure_readiness:missing_manifest path:{manifest_path}")
+    structure_coordinate_records = int(
+        structure_readiness.get("coordinate_bearing_records")
+        or structure_readiness.get("coordinate_rows")
+        or structure_readiness.get("rows")
+        or 0
+    )
+    structure_association_records = int(structure_readiness.get("structure_association_records") or 0)
 
     wandb_run = None
     if master_process and os.environ.get("WANDB_PROJECT"):
@@ -2617,6 +2627,9 @@ def main() -> None:
         f"next_segment_weight:{args.long_entry_next_segment_weight} "
         f"boundary_weight:{args.long_entry_boundary_weight} "
         f"coverage_weight:{args.long_entry_segment_coverage_weight} "
+        f"fot_loss_weight:{args.long_entry_fot_loss_weight} "
+        f"fot_every:{args.long_entry_fot_every} "
+        f"fot_max_segments:{args.long_entry_fot_max_segments} "
         f"full_context_every:{args.long_entry_full_context_every} "
         f"full_context_seq_len:{args.long_entry_full_context_seq_len} "
         f"full_context_loss_weight:{args.long_entry_full_context_loss_weight} "
@@ -2642,8 +2655,9 @@ def main() -> None:
         f"frame_weight:{args.toricblm_structure_frame_weight} "
         f"start_step:{args.toricblm_structure_flow_start_step} "
         f"readiness_manifest:{args.toricblm_structure_readiness_manifest or 'none'} "
-        f"coordinate_records:{int(structure_readiness.get('coordinate_bearing_records', 0) or 0)} "
-        f"association_records:{int(structure_readiness.get('structure_association_records', 0) or 0)} "
+        f"coordinate_records:{structure_coordinate_records} "
+        f"association_records:{structure_association_records} "
+        f"target_shortfalls:{json.dumps(structure_readiness.get('target_shortfalls', {}), sort_keys=True)} "
         f"status:{structure_readiness.get('structure_flow_status', 'unknown')}"
     )
     log0(
@@ -2866,6 +2880,9 @@ def main() -> None:
         next_nce_losses: list[Tensor] = []
         boundary_losses: list[Tensor] = []
         coverage_losses: list[Tensor] = []
+        fot_losses: list[Tensor] = []
+        fot_rewards: list[Tensor] = []
+        fot_diversities: list[Tensor] = []
         segment_counts: list[int] = []
         token_count = 0
         byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -2888,13 +2905,43 @@ def main() -> None:
             for segment in segments:
                 sx = segment[:-1].view(1, -1)
                 sy = segment[1:].view(1, -1)
-                lm_loss, hidden, _nll = base_model.forward_aux(
+                lm_loss, hidden, segment_nll = base_model.forward_aux(
                     sx,
                     sy,
                     flatten_graph_output=True,
                     activation_checkpoint=bool(args.long_entry_segment_checkpoint),
                 )
                 row_segment_losses.append(lm_loss)
+                if (
+                    oai_fot_head is not None
+                    and float(args.long_entry_fot_loss_weight) > 0.0
+                    and int(args.long_entry_fot_every) > 0
+                    and step_value % int(args.long_entry_fot_every) == 0
+                    and len(fot_losses) < max(1, int(args.long_entry_fot_max_segments))
+                ):
+                    segment_bytes = sentencepiece_target_byte_lengths(
+                        sx,
+                        sy,
+                        base_bytes_lut,
+                        has_leading_space_lut,
+                        is_boundary_token_lut,
+                    )
+                    lm_weight = base_model.tok_emb.weight if base_model.tie_embeddings else base_model.lm_head.weight
+                    fot_control = current_fot_control()
+                    fot_out = oai_fot_head(
+                        hidden,
+                        sy,
+                        segment_nll,
+                        target_byte_lengths=segment_bytes,
+                        lm_head_weight=lm_weight,
+                        logit_softcap=float(args.logit_softcap),
+                        temperature_multiplier=float(fot_control["temperature_multiplier"]),
+                        ucb_multiplier=float(fot_control["ucb_multiplier"]),
+                        sparse_multiplier=float(fot_control["sparse_multiplier"]),
+                    )
+                    fot_losses.append(fot_out["oai_fot_loss"])
+                    fot_rewards.append(fot_out["oai_fot_reward_mean"])
+                    fot_diversities.append(fot_out["oai_fot_tree_diversity"])
                 summaries.append(hidden.float().mean(dim=1).squeeze(0))
                 first_states.append(hidden[:, 0, :].float().squeeze(0))
                 last_states.append(hidden[:, -1, :].float().squeeze(0))
@@ -2923,6 +2970,9 @@ def main() -> None:
         next_nce = torch.stack(next_nce_losses).mean() if next_nce_losses else zero
         boundary = torch.stack(boundary_losses).mean() if boundary_losses else zero
         coverage = torch.stack(coverage_losses).mean() if coverage_losses else zero
+        long_entry_fot = torch.stack(fot_losses).mean() if fot_losses else zero
+        long_entry_fot_reward = torch.stack(fot_rewards).mean() if fot_rewards else zero
+        long_entry_fot_diversity = torch.stack(fot_diversities).mean() if fot_diversities else zero
         full_context_loss = zero
         full_context_tokens = 0
         full_context_active = False
@@ -2953,6 +3003,7 @@ def main() -> None:
             + float(args.long_entry_next_segment_weight) * next_nce
             + float(args.long_entry_boundary_weight) * boundary
             + float(args.long_entry_segment_coverage_weight) * coverage
+            + float(args.long_entry_fot_loss_weight) * long_entry_fot
             + float(args.long_entry_full_context_loss_weight) * full_context_loss
         )
         bits_per_token = float(ce.detach().float().item() / math.log(2.0)) if segment_losses else 0.0
@@ -2978,6 +3029,10 @@ def main() -> None:
             "long_entry_full_row/next_segment_nce": float(next_nce.detach().float().item()),
             "long_entry_full_row/boundary_continuity": float(boundary.detach().float().item()),
             "long_entry_full_row/segment_coverage_loss": float(coverage.detach().float().item()),
+            "long_entry_full_row/fot_loss": float(long_entry_fot.detach().float().item()),
+            "long_entry_full_row/fot_segments": float(len(fot_losses)),
+            "long_entry_full_row/fot_reward_mean": float(long_entry_fot_reward.detach().float().item()),
+            "long_entry_full_row/fot_tree_diversity": float(long_entry_fot_diversity.detach().float().item()),
             "long_entry_full_row/truncated_rows": float(truncated_count),
             "long_entry_full_row/original_tokens_mean": original_mean,
             "long_entry_full_row/emitted_tokens_mean": emitted_mean,
@@ -2988,6 +3043,9 @@ def main() -> None:
             "long_entry_full_row/next_segment_weight": float(args.long_entry_next_segment_weight * aux_stage_multiplier),
             "long_entry_full_row/boundary_weight": float(args.long_entry_boundary_weight * aux_stage_multiplier),
             "long_entry_full_row/coverage_weight": float(args.long_entry_segment_coverage_weight * aux_stage_multiplier),
+            "long_entry_full_row/fot_weight": float(args.long_entry_fot_loss_weight * aux_stage_multiplier),
+            "long_entry_full_row/fot_every": float(args.long_entry_fot_every),
+            "long_entry_full_row/fot_max_segments": float(args.long_entry_fot_max_segments),
             "long_entry_full_row/full_context_weight": float(args.long_entry_full_context_loss_weight * aux_stage_multiplier),
         }
         return weighted, metrics
@@ -3722,6 +3780,7 @@ def main() -> None:
                 + args.long_entry_next_segment_weight
                 + args.long_entry_boundary_weight
                 + args.long_entry_segment_coverage_weight
+                + args.long_entry_fot_loss_weight
                 + args.long_entry_full_context_loss_weight
             )
             > 0.0
@@ -4074,6 +4133,9 @@ def main() -> None:
                 "long_entry_full_row/next_segment_weight_config": float(args.long_entry_next_segment_weight),
                 "long_entry_full_row/boundary_weight_config": float(args.long_entry_boundary_weight),
                 "long_entry_full_row/coverage_weight_config": float(args.long_entry_segment_coverage_weight),
+                "long_entry_full_row/fot_loss_weight_config": float(args.long_entry_fot_loss_weight),
+                "long_entry_full_row/fot_every_config": float(args.long_entry_fot_every),
+                "long_entry_full_row/fot_max_segments_config": float(args.long_entry_fot_max_segments),
                 "long_entry_full_row/full_context_every_config": float(args.long_entry_full_context_every),
                 "long_entry_full_row/full_context_seq_len_config": float(args.long_entry_full_context_seq_len),
                 "long_entry_full_row/full_context_min_tokens_config": float(args.long_entry_full_context_min_tokens),
@@ -4094,12 +4156,17 @@ def main() -> None:
                 "toricblm_structure/frame_weight_config": float(args.toricblm_structure_frame_weight),
                 "toricblm_structure/start_step_config": float(args.toricblm_structure_flow_start_step),
                 "toricblm_structure/coordinate_bearing_records": float(
-                    structure_readiness.get("coordinate_bearing_records", 0) or 0
+                    structure_coordinate_records
                 ),
                 "toricblm_structure/structure_association_records": float(
-                    structure_readiness.get("structure_association_records", 0) or 0
+                    structure_association_records
                 ),
-                "toricblm_structure/readiness_records": float(structure_readiness.get("records", 0) or 0),
+                "toricblm_structure/readiness_records": float(
+                    structure_readiness.get("records") or structure_readiness.get("rows") or 0
+                ),
+                "toricblm_structure/target_shortfall_count": float(
+                    len(structure_readiness.get("target_shortfalls", {}) or {})
+                ),
                 "toricblm_structure/coordinate_losses_active": float(
                     args.toricblm_structure_flow and structure_loader is not None and structure_head is not None
                 ),
