@@ -2332,6 +2332,8 @@ def main() -> None:
                 oai_gflownet_head.load_state_dict(checkpoint["oai_gflownet"], strict=True)
             if oai_fot_head is not None and checkpoint.get("oai_fot") is not None:
                 oai_fot_head.load_state_dict(checkpoint["oai_fot"], strict=True)
+            if structure_head is not None and checkpoint.get("structure_head") is not None:
+                structure_head.load_state_dict(checkpoint["structure_head"], strict=True)
             if args.start_step <= 0:
                 args.start_step = int(checkpoint.get("step", 0))
         else:
@@ -3216,9 +3218,11 @@ def main() -> None:
             "sidecar": sidecar.state_dict() if sidecar is not None else None,
             "oai_gflownet": oai_gflownet_head.state_dict() if oai_gflownet_head is not None else None,
             "oai_fot": oai_fot_head.state_dict() if oai_fot_head is not None else None,
+            "structure_head": structure_head.state_dict() if structure_head is not None else None,
             "toricgt_sidecar_enabled": bool(sidecar is not None),
             "oai_gflownet_enabled": bool(oai_gflownet_head is not None),
             "oai_embedding_fot_enabled": bool(oai_fot_head is not None),
+            "toricblm_structure_flow_enabled": bool(structure_head is not None),
             "graph_lm_primary_enabled": bool(graph_lm_loader is not None),
             "long_entry_full_row_enabled": bool(long_entry_loader is not None),
             "graph_output_flattening_enabled": bool(base_model.graph_output_flattening is not None),
