@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint
 
 try:
     from convextok import ConvexTokTokenizer, PRICED_OFFSET
@@ -67,6 +68,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    main_activation_checkpoint = bool(int(os.environ.get("MAIN_ACTIVATION_CHECKPOINT", "0")))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -185,11 +187,36 @@ class Hyperparameters:
     )
     graph_lm_warmup_steps = int(os.environ.get("GRAPH_LM_WARMUP_STEPS", 350))
     graph_lm_hold_steps = int(os.environ.get("GRAPH_LM_HOLD_STEPS", 25))
+
+    # Complete-entry graph/FoT training.  This path keeps row boundaries and
+    # trains all segments of long graphified records instead of losing them in a
+    # fixed-size token stream.  It is separate from the BPB FineWeb stream so
+    # full biological/FoT entries can be learned while validation stays the OAI
+    # challenge BPB objective.
+    long_entry_training = bool(int(os.environ.get("LONG_ENTRY_TRAINING", "0")))
+    long_entry_train_glob = os.environ.get("LONG_ENTRY_TRAIN_GLOB", late_graph_train_glob or graph_train_glob).strip()
+    long_entry_every = int(os.environ.get("LONG_ENTRY_EVERY", "8"))
+    long_entry_batch_size = int(os.environ.get("LONG_ENTRY_BATCH_SIZE", "1"))
+    long_entry_max_tokens = int(os.environ.get("LONG_ENTRY_MAX_TOKENS", "24576"))
+    long_entry_segment_len = int(os.environ.get("LONG_ENTRY_SEGMENT_LEN", str(train_seq_len)))
+    long_entry_segment_stride = int(os.environ.get("LONG_ENTRY_SEGMENT_STRIDE", str(long_entry_segment_len)))
+    long_entry_max_segments = int(os.environ.get("LONG_ENTRY_MAX_SEGMENTS", "24"))
+    long_entry_loss_weight = float(os.environ.get("LONG_ENTRY_LOSS_WEIGHT", "0.020"))
+    long_entry_next_segment_weight = float(os.environ.get("LONG_ENTRY_NEXT_SEGMENT_WEIGHT", "0.010"))
+    long_entry_boundary_weight = float(os.environ.get("LONG_ENTRY_BOUNDARY_WEIGHT", "0.004"))
+    long_entry_segment_coverage_weight = float(os.environ.get("LONG_ENTRY_SEGMENT_COVERAGE_WEIGHT", "0.002"))
+    long_entry_full_context_every = int(os.environ.get("LONG_ENTRY_FULL_CONTEXT_EVERY", "64"))
+    long_entry_full_context_seq_len = int(os.environ.get("LONG_ENTRY_FULL_CONTEXT_SEQ_LEN", "8192"))
+    long_entry_full_context_loss_weight = float(os.environ.get("LONG_ENTRY_FULL_CONTEXT_LOSS_WEIGHT", "0.006"))
+    long_entry_full_context_min_tokens = int(os.environ.get("LONG_ENTRY_FULL_CONTEXT_MIN_TOKENS", "2048"))
+    long_entry_segment_checkpoint = bool(int(os.environ.get("LONG_ENTRY_SEGMENT_CHECKPOINT", "0")))
+    long_entry_full_context_checkpoint = bool(int(os.environ.get("LONG_ENTRY_FULL_CONTEXT_CHECKPOINT", "1")))
     aux_grad_routing = bool(int(os.environ.get("AUX_GRAD_ROUTING", "1")))
     aux_grad_route_graph_lm = bool(int(os.environ.get("AUX_GRAD_ROUTE_GRAPH_LM", "1")))
     aux_grad_route_sidecar = bool(int(os.environ.get("AUX_GRAD_ROUTE_SIDECAR", "1")))
     aux_grad_route_teacher = bool(int(os.environ.get("AUX_GRAD_ROUTE_TEACHER", "1")))
     aux_grad_route_structure = bool(int(os.environ.get("AUX_GRAD_ROUTE_STRUCTURE", "1")))
+    aux_grad_route_long_entry = bool(int(os.environ.get("AUX_GRAD_ROUTE_LONG_ENTRY", "1")))
     aux_grad_conflict_projection = bool(int(os.environ.get("AUX_GRAD_CONFLICT_PROJECTION", "1")))
     aux_grad_aligned_boost = float(os.environ.get("AUX_GRAD_ALIGNED_BOOST", 1.0))
     bpb_first_aux_staging = bool(int(os.environ.get("BPB_FIRST_AUX_STAGING", "1")))
@@ -370,6 +397,7 @@ class Hyperparameters:
     checkpoint_dir = os.environ.get("CHECKPOINT_DIR", "checkpoints/parameter_golf_oai_dense")
     resume_checkpoint = os.environ.get("RESUME_CHECKPOINT", "")
     start_step = int(os.environ.get("START_STEP", "0"))
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -938,12 +966,13 @@ class DistributedTokenLoader:
 
 from toricgt.embedding_forest_of_thought import EmbeddingFoTConfig, EmbeddingForestOfThoughtHead
 from toricgt.oai_sidecar import (
+    FullEntryGraphParquetStream,
     GraphParquetTokenStream,
     ScheduledGraphParquetTokenStream,
     StructureCoordinateParquetStream,
     ToricGTSidecar,
 )
-from toricgt.structure_flow_matching import structure_flow_loss
+from toricgt.structure_flow_matching import rectified_flow_trajectory_frames, structure_flow_loss
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1504,6 +1533,8 @@ class OAIStructureCoordinateHead(nn.Module):
         contact_weight: float,
         distogram_weight: float,
         noise_scale: float = 0.15,
+        return_trajectory: bool = False,
+        trajectory_steps: int = 16,
     ) -> dict[str, Tensor]:
         max_atoms = min(int(target_coords.shape[1]), int(hidden.shape[1]))
         h = hidden[:, :max_atoms, :]
@@ -1511,7 +1542,7 @@ class OAIStructureCoordinateHead(nn.Module):
         mask = coord_mask[:, :max_atoms].bool()
         if not bool(mask.any()):
             zero = hidden.float().sum() * 0.0
-            return {
+            out = {
                 "structure_loss": zero,
                 "flow_matching_loss": zero.detach(),
                 "contact_bce_loss": zero.detach(),
@@ -1519,6 +1550,16 @@ class OAIStructureCoordinateHead(nn.Module):
                 "rmsd": zero.detach(),
                 "coordinate_count": zero.detach(),
             }
+            if return_trajectory:
+                out["flow_trajectory"] = torch.empty(
+                    target_coords.shape[0],
+                    max(2, int(trajectory_steps)),
+                    max_atoms,
+                    3,
+                    dtype=target_coords.dtype,
+                    device=target_coords.device,
+                )
+            return out
         # Center coordinates per structure for stable prediction, but keep the
         # geometry real: targets are AFDB/PDB coordinates after translation only.
         atom_mask = mask.unsqueeze(-1).float()
@@ -1548,7 +1589,7 @@ class OAIStructureCoordinateHead(nn.Module):
             contact_weight=float(contact_weight),
             distogram_weight=float(distogram_weight),
         )
-        return {
+        out = {
             "structure_loss": metrics.loss,
             "flow_matching_loss": metrics.flow_matching_loss.detach(),
             "contact_bce_loss": metrics.contact_bce_loss.detach(),
@@ -1556,6 +1597,14 @@ class OAIStructureCoordinateHead(nn.Module):
             "rmsd": metrics.rmsd.detach(),
             "coordinate_count": metrics.coordinate_count.detach(),
         }
+        if return_trajectory:
+            out["flow_trajectory"] = rectified_flow_trajectory_frames(
+                noisy.detach(),
+                pred_velocity.detach(),
+                mask.detach(),
+                steps=int(trajectory_steps),
+            )
+        return out
 
 
 class Block(nn.Module):
@@ -1721,7 +1770,13 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _hidden(self, input_ids: Tensor, *, flatten_graph_output: bool) -> Tensor:
+    def _hidden(
+        self,
+        input_ids: Tensor,
+        *,
+        flatten_graph_output: bool,
+        activation_checkpoint: bool = False,
+    ) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.fineweb_tokengt is not None:
             x = x + self.fineweb_tokengt(input_ids).to(dtype=x.dtype)
@@ -1731,12 +1786,14 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            block = self.blocks[i]
+            x = checkpoint(block, x, x0, use_reentrant=False) if activation_checkpoint and self.training else block(x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block = self.blocks[self.num_encoder_layers + i]
+            x = checkpoint(block, x, x0, use_reentrant=False) if activation_checkpoint and self.training else block(x, x0)
 
         x = self.final_norm(x)
         if flatten_graph_output and self.graph_output_flattening is not None:
@@ -1809,7 +1866,11 @@ class GPT(nn.Module):
         return F.mse_loss(emb @ emb.T, features @ features.T)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        hidden = self._hidden(input_ids, flatten_graph_output=True)
+        hidden = self._hidden(
+            input_ids,
+            flatten_graph_output=True,
+            activation_checkpoint=bool(getattr(self, "main_activation_checkpoint", False)),
+        )
         loss, _ = self._loss_from_hidden(hidden, target_ids)
         return loss
 
@@ -1819,8 +1880,13 @@ class GPT(nn.Module):
         target_ids: Tensor,
         *,
         flatten_graph_output: bool = False,
+        activation_checkpoint: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        hidden = self._hidden(input_ids, flatten_graph_output=flatten_graph_output)
+        hidden = self._hidden(
+            input_ids,
+            flatten_graph_output=flatten_graph_output,
+            activation_checkpoint=activation_checkpoint,
+        )
         loss, per_token_nll = self._loss_from_hidden(hidden, target_ids)
         return loss, hidden, per_token_nll
 
@@ -1873,7 +1939,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if bool(args.compile_model):
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -2124,6 +2191,7 @@ def main() -> None:
     sidecar = None
     graph_loader = None
     graph_lm_loader = None
+    long_entry_loader = None
     oai_gflownet_head = None
     oai_fot_head = None
     structure_loader = None
@@ -2173,12 +2241,28 @@ def main() -> None:
             log0("toricgt_sidecar:init_failed_nonfatal enabled=0")
             sidecar = None
             graph_loader = None
+    if args.long_entry_training:
+        if not args.long_entry_train_glob:
+            raise ValueError("LONG_ENTRY_TRAINING=1 requires LONG_ENTRY_TRAIN_GLOB, LATE_GRAPH_TRAIN_GLOB, or GRAPH_TRAIN_GLOB")
+        if args.long_entry_segment_len < 32:
+            raise ValueError("LONG_ENTRY_SEGMENT_LEN must be at least 32")
+        if args.long_entry_segment_stride < 1:
+            raise ValueError("LONG_ENTRY_SEGMENT_STRIDE must be positive")
+        if args.long_entry_max_tokens < args.long_entry_segment_len:
+            raise ValueError("LONG_ENTRY_MAX_TOKENS must be at least LONG_ENTRY_SEGMENT_LEN")
+        long_entry_loader = FullEntryGraphParquetStream(
+            args.long_entry_train_glob,
+            graph_text_tokenizer,
+            batch_size=args.long_entry_batch_size,
+            max_tokens=args.long_entry_max_tokens,
+        )
     if args.oai_gflownet:
         oai_gflownet_head = OAIEmbeddingGFlowNetHead(
             args.model_dim,
             num_actions=args.oai_gflownet_num_actions,
             hidden_dim=args.oai_gflownet_hidden_dim,
-        ).to(device)
+    ).to(device)
+    base_model.main_activation_checkpoint = bool(args.main_activation_checkpoint)
     if args.oai_embedding_fot:
         oai_fot_head = EmbeddingForestOfThoughtHead(
             EmbeddingFoTConfig(
@@ -2307,7 +2391,7 @@ def main() -> None:
             "teacher_distill:"
             f"enabled:0 checkpoint:{args.teacher_checkpoint or 'none'} weight:{args.teacher_distill_weight}"
         )
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model: nn.Module = torch.compile(base_model, dynamic=False, fullgraph=True) if args.compile_model else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -2522,6 +2606,25 @@ def main() -> None:
         f"stream:{graph_lm_loader.describe() if graph_lm_loader is not None else 'disabled'}"
     )
     log0(
+        "long_entry_full_row_training:"
+        f"enabled:{int(long_entry_loader is not None)} "
+        f"glob:{args.long_entry_train_glob or 'disabled'} "
+        f"stream:{long_entry_loader.describe() if long_entry_loader is not None else 'disabled'} "
+        f"every:{args.long_entry_every} batch_size:{args.long_entry_batch_size} "
+        f"max_tokens:{args.long_entry_max_tokens} segment_len:{args.long_entry_segment_len} "
+        f"segment_stride:{args.long_entry_segment_stride} max_segments:{args.long_entry_max_segments} "
+        f"loss_weight:{args.long_entry_loss_weight} "
+        f"next_segment_weight:{args.long_entry_next_segment_weight} "
+        f"boundary_weight:{args.long_entry_boundary_weight} "
+        f"coverage_weight:{args.long_entry_segment_coverage_weight} "
+        f"full_context_every:{args.long_entry_full_context_every} "
+        f"full_context_seq_len:{args.long_entry_full_context_seq_len} "
+        f"full_context_loss_weight:{args.long_entry_full_context_loss_weight} "
+        f"full_context_min_tokens:{args.long_entry_full_context_min_tokens} "
+        f"segment_checkpoint:{int(args.long_entry_segment_checkpoint)} "
+        f"full_context_checkpoint:{int(args.long_entry_full_context_checkpoint)}"
+    )
+    log0(
         "toricblm_structure_training:"
         f"flow_enabled:{int(args.toricblm_structure_flow)} "
         f"head_enabled:{int(structure_head is not None)} "
@@ -2563,6 +2666,7 @@ def main() -> None:
         "advanced_bpb_controls:"
         f"aux_grad_routing:{int(args.aux_grad_routing)} graph_lm:{int(args.aux_grad_route_graph_lm)} "
         f"sidecar:{int(args.aux_grad_route_sidecar)} teacher:{int(args.aux_grad_route_teacher)} "
+        f"long_entry:{int(args.aux_grad_route_long_entry)} "
         f"retrieval_conditioned_aux:{int(args.retrieval_conditioned_aux)} "
         f"uncertainty_weighting:{int(args.sidecar_uncertainty_weighting)} "
         f"bpb_first_staging:{int(args.bpb_first_aux_staging)} "
@@ -2615,6 +2719,8 @@ def main() -> None:
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"compile_model:{int(args.compile_model)}")
+    log0(f"main_activation_checkpoint:{int(args.main_activation_checkpoint)}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -2726,6 +2832,165 @@ def main() -> None:
             f"aux_grad_routing/{name}_aux_norm": math.sqrt(max(aux_norm_sq, 0.0)),
             f"aux_grad_routing/{name}_routed_norm": math.sqrt(max(routed_norm_sq, 0.0)),
         }
+
+    def split_long_entry_segments(entry: Tensor) -> list[Tensor]:
+        segment_len = max(2, int(args.long_entry_segment_len))
+        stride = max(1, int(args.long_entry_segment_stride))
+        max_segments = int(args.long_entry_max_segments)
+        if entry.numel() < 2:
+            return []
+        starts = list(range(0, max(1, int(entry.numel()) - 1), stride))
+        if starts and starts[-1] + segment_len + 1 < int(entry.numel()):
+            starts.append(max(0, int(entry.numel()) - segment_len - 1))
+        if max_segments > 0 and len(starts) > max_segments:
+            chosen = torch.linspace(0, len(starts) - 1, steps=max_segments).round().long().tolist()
+            starts = [starts[idx] for idx in chosen]
+        segments: list[Tensor] = []
+        seen_starts: set[int] = set()
+        for start in starts:
+            if start in seen_starts:
+                continue
+            seen_starts.add(start)
+            end = min(int(entry.numel()), start + segment_len + 1)
+            segment = entry[start:end]
+            if segment.numel() >= 2:
+                segments.append(segment)
+        return segments
+
+    def compute_long_entry_objective(entry_batch: dict[str, object], step_value: int) -> tuple[Tensor, dict[str, float]]:
+        zero = next(base_model.parameters()).sum() * 0.0
+        entries = entry_batch["entries"]
+        if not isinstance(entries, list) or not entries:
+            return zero, {"long_entry_full_row/enabled": 1.0, "long_entry_full_row/rows": 0.0}
+        segment_losses: list[Tensor] = []
+        next_nce_losses: list[Tensor] = []
+        boundary_losses: list[Tensor] = []
+        coverage_losses: list[Tensor] = []
+        segment_counts: list[int] = []
+        token_count = 0
+        byte_count = torch.zeros((), device=device, dtype=torch.float64)
+        truncated_count = 0
+        original_lengths = entry_batch.get("original_lengths", [])
+        lengths = entry_batch.get("lengths", [])
+        truncated = entry_batch.get("truncated", [])
+
+        for row_index, entry in enumerate(entries):
+            if not torch.is_tensor(entry):
+                continue
+            if isinstance(truncated, list) and row_index < len(truncated) and bool(truncated[row_index]):
+                truncated_count += 1
+            segments = split_long_entry_segments(entry)
+            segment_counts.append(len(segments))
+            summaries: list[Tensor] = []
+            first_states: list[Tensor] = []
+            last_states: list[Tensor] = []
+            row_segment_losses: list[Tensor] = []
+            for segment in segments:
+                sx = segment[:-1].view(1, -1)
+                sy = segment[1:].view(1, -1)
+                lm_loss, hidden, _nll = base_model.forward_aux(
+                    sx,
+                    sy,
+                    flatten_graph_output=True,
+                    activation_checkpoint=bool(args.long_entry_segment_checkpoint),
+                )
+                row_segment_losses.append(lm_loss)
+                summaries.append(hidden.float().mean(dim=1).squeeze(0))
+                first_states.append(hidden[:, 0, :].float().squeeze(0))
+                last_states.append(hidden[:, -1, :].float().squeeze(0))
+                token_count += int(sy.numel())
+                byte_count = byte_count + count_sentencepiece_target_bytes(
+                    sx,
+                    sy,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+            if row_segment_losses:
+                segment_losses.append(torch.stack(row_segment_losses).mean())
+            if len(summaries) >= 2:
+                summary = F.normalize(torch.stack(summaries), dim=-1)
+                logits = summary[:-1] @ summary[1:].T / 0.20
+                targets = torch.arange(logits.shape[0], device=logits.device)
+                next_nce_losses.append(F.cross_entropy(logits.float(), targets))
+                left = F.normalize(torch.stack(last_states[:-1]), dim=-1)
+                right = F.normalize(torch.stack(first_states[1:]), dim=-1)
+                boundary_losses.append((1.0 - (left * right).sum(dim=-1)).mean())
+                coverage = summary.float().var(dim=0, unbiased=False).mean()
+                coverage_losses.append(torch.relu(summary.new_tensor(0.010) - coverage))
+
+        ce = torch.stack(segment_losses).mean() if segment_losses else zero
+        next_nce = torch.stack(next_nce_losses).mean() if next_nce_losses else zero
+        boundary = torch.stack(boundary_losses).mean() if boundary_losses else zero
+        coverage = torch.stack(coverage_losses).mean() if coverage_losses else zero
+        full_context_loss = zero
+        full_context_tokens = 0
+        full_context_active = False
+        if (
+            int(args.long_entry_full_context_every) > 0
+            and step_value % int(args.long_entry_full_context_every) == 0
+            and float(args.long_entry_full_context_loss_weight) > 0.0
+        ):
+            full_cap = max(2, int(args.long_entry_full_context_seq_len))
+            min_tokens = max(2, int(args.long_entry_full_context_min_tokens))
+            candidates = [entry for entry in entries if torch.is_tensor(entry) and int(entry.numel()) >= min_tokens]
+            if candidates:
+                full_entry = candidates[0][: full_cap + 1]
+                if full_entry.numel() >= 2:
+                    fx = full_entry[:-1].view(1, -1)
+                    fy = full_entry[1:].view(1, -1)
+                    full_context_loss, _, _ = base_model.forward_aux(
+                        fx,
+                        fy,
+                        flatten_graph_output=True,
+                        activation_checkpoint=bool(args.long_entry_full_context_checkpoint),
+                    )
+                    full_context_tokens = int(fy.numel())
+                    full_context_active = True
+
+        weighted = aux_stage_multiplier * (
+            float(args.long_entry_loss_weight) * ce
+            + float(args.long_entry_next_segment_weight) * next_nce
+            + float(args.long_entry_boundary_weight) * boundary
+            + float(args.long_entry_segment_coverage_weight) * coverage
+            + float(args.long_entry_full_context_loss_weight) * full_context_loss
+        )
+        bits_per_token = float(ce.detach().float().item() / math.log(2.0)) if segment_losses else 0.0
+        tokens_per_byte = float(token_count / max(float(byte_count.detach().float().item()), 1.0))
+        original_mean = 0.0
+        emitted_mean = 0.0
+        if isinstance(original_lengths, list) and original_lengths:
+            original_mean = float(sum(int(x) for x in original_lengths) / len(original_lengths))
+        if isinstance(lengths, list) and lengths:
+            emitted_mean = float(sum(int(x) for x in lengths) / len(lengths))
+        metrics = {
+            "long_entry_full_row/enabled": 1.0,
+            "long_entry_full_row/loss": float(ce.detach().float().item()),
+            "long_entry_full_row/weighted_loss": float(weighted.detach().float().item()),
+            "long_entry_full_row/bpb": float(bits_per_token * tokens_per_byte),
+            "long_entry_full_row/bits_per_token": float(bits_per_token),
+            "long_entry_full_row/tokens_per_byte": float(tokens_per_byte),
+            "long_entry_full_row/rows": float(len(entries)),
+            "long_entry_full_row/segments": float(sum(segment_counts)),
+            "long_entry_full_row/segments_per_row": float(sum(segment_counts) / max(1, len(segment_counts))),
+            "long_entry_full_row/target_tokens": float(token_count),
+            "long_entry_full_row/target_bytes": float(byte_count.detach().float().item()),
+            "long_entry_full_row/next_segment_nce": float(next_nce.detach().float().item()),
+            "long_entry_full_row/boundary_continuity": float(boundary.detach().float().item()),
+            "long_entry_full_row/segment_coverage_loss": float(coverage.detach().float().item()),
+            "long_entry_full_row/truncated_rows": float(truncated_count),
+            "long_entry_full_row/original_tokens_mean": original_mean,
+            "long_entry_full_row/emitted_tokens_mean": emitted_mean,
+            "long_entry_full_row/full_context_active": float(full_context_active),
+            "long_entry_full_row/full_context_loss": float(full_context_loss.detach().float().item()),
+            "long_entry_full_row/full_context_tokens": float(full_context_tokens),
+            "long_entry_full_row/loss_weight": float(args.long_entry_loss_weight * aux_stage_multiplier),
+            "long_entry_full_row/next_segment_weight": float(args.long_entry_next_segment_weight * aux_stage_multiplier),
+            "long_entry_full_row/boundary_weight": float(args.long_entry_boundary_weight * aux_stage_multiplier),
+            "long_entry_full_row/coverage_weight": float(args.long_entry_segment_coverage_weight * aux_stage_multiplier),
+            "long_entry_full_row/full_context_weight": float(args.long_entry_full_context_loss_weight * aux_stage_multiplier),
+        }
+        return weighted, metrics
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -2897,6 +3162,7 @@ def main() -> None:
             "oai_gflownet_enabled": bool(oai_gflownet_head is not None),
             "oai_embedding_fot_enabled": bool(oai_fot_head is not None),
             "graph_lm_primary_enabled": bool(graph_lm_loader is not None),
+            "long_entry_full_row_enabled": bool(long_entry_loader is not None),
             "graph_output_flattening_enabled": bool(base_model.graph_output_flattening is not None),
             "val_loss": val_loss_value,
             "val_bpb": val_bpb_value,
@@ -2906,7 +3172,16 @@ def main() -> None:
             },
         }
         path = ckpt_dir / f"{args.run_id}_step_{int(step_value):06d}.pt"
-        torch.save(payload, path)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        try:
+            torch.save(payload, tmp_path)
+            tmp_path.replace(path)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
         log0(f"checkpoint_saved:{path} step:{step_value} val_bpb:{val_bpb_value}")
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
@@ -3006,6 +3281,7 @@ def main() -> None:
         train_token_count = torch.zeros((), device=device, dtype=torch.float64)
         train_byte_count = torch.zeros((), device=device, dtype=torch.float64)
         graph_lm_metrics: dict[str, float] = {}
+        long_entry_metrics: dict[str, float] = {}
         sidecar_metrics: dict[str, float] = {}
         teacher_metrics: dict[str, float] = {}
         oai_gflownet_metrics: dict[str, float] = {}
@@ -3438,6 +3714,34 @@ def main() -> None:
             }
 
         if (
+            long_entry_loader is not None
+            and args.long_entry_every > 0
+            and step % args.long_entry_every == 0
+            and (
+                args.long_entry_loss_weight
+                + args.long_entry_next_segment_weight
+                + args.long_entry_boundary_weight
+                + args.long_entry_segment_coverage_weight
+                + args.long_entry_full_context_loss_weight
+            )
+            > 0.0
+        ):
+            entry_batch = long_entry_loader.next_entries(device, step=step)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                weighted_long_entry_loss, long_entry_metrics = compute_long_entry_objective(entry_batch, step)
+            if args.aux_grad_routing and args.aux_grad_route_long_entry:
+                saved_base_grads = snapshot_base_grads()
+                zero_base_grads()
+                weighted_long_entry_loss.backward()
+                aux = snapshot_base_grads()
+                routed, metrics = route_aux_grads(primary_grads, aux, name="long_entry")
+                restore_base_grads(saved_base_grads)
+                add_base_grads(routed)
+                aux_grad_metrics.update(metrics)
+            else:
+                weighted_long_entry_loss.backward()
+
+        if (
             structure_loader is not None
             and structure_head is not None
             and args.toricblm_structure_flow
@@ -3594,6 +3898,14 @@ def main() -> None:
                     f" graph_lm_bpb:{graph_lm_metrics.get('graph_lm_primary/bpb', 0.0):.4f}"
                     f" graph_lm_w:{graph_lm_metrics.get('graph_lm_primary/loss_weight', 0.0):.4f}"
                 )
+            long_entry_brief = ""
+            if long_entry_metrics:
+                long_entry_brief = (
+                    f" long_entry_loss:{long_entry_metrics.get('long_entry_full_row/loss', 0.0):.6f}"
+                    f" long_entry_bpb:{long_entry_metrics.get('long_entry_full_row/bpb', 0.0):.4f}"
+                    f" long_entry_segments:{long_entry_metrics.get('long_entry_full_row/segments', 0.0):.0f}"
+                    f" long_entry_full:{long_entry_metrics.get('long_entry_full_row/full_context_active', 0.0):.0f}"
+                )
             teacher_brief = ""
             if teacher_metrics:
                 teacher_brief = (
@@ -3649,6 +3961,28 @@ def main() -> None:
                     f" cca:{sidecar_metrics.get('toricgt_sidecar/toric_cca_topology_loss', 0.0):.6f}"
                     f" derived:{sidecar_metrics.get('toricgt_sidecar/derived_signature_loss', 0.0):.6f}"
                 )
+            graph_equiv_bpb_terms = [
+                float(value)
+                for value in (
+                    graph_lm_metrics.get("graph_lm_primary/bpb"),
+                    long_entry_metrics.get("long_entry_full_row/bpb"),
+                )
+                if value is not None and math.isfinite(float(value)) and float(value) > 0.0
+            ]
+            graph_equiv_bpb = (
+                sum(graph_equiv_bpb_terms) / max(1, len(graph_equiv_bpb_terms))
+                if graph_equiv_bpb_terms
+                else float("nan")
+            )
+            graph_equiv_primary_bpb = float(
+                long_entry_metrics.get(
+                    "long_entry_full_row/bpb",
+                    graph_lm_metrics.get("graph_lm_primary/bpb", float("nan")),
+                )
+            )
+            graph_equiv_brief = ""
+            if math.isfinite(graph_equiv_bpb):
+                graph_equiv_brief = f" graph_equiv_bpb:{graph_equiv_bpb:.4f}"
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_bpb:{train_bpb:.4f} train_bpt:{train_bits_per_token:.4f} "
@@ -3656,12 +3990,14 @@ def main() -> None:
                 f"step_avg:{approx_training_time_ms / max(step - args.start_step, 1):.2f}ms"
                 f" aux_stage:{bpb_aux_metrics.get('bpb_aux_control/stage_multiplier', 1.0):.4f}"
                 f"{graph_lm_brief}"
+                f"{long_entry_brief}"
                 f"{teacher_brief}"
                 f"{gflownet_brief}"
                 f"{fot_brief}"
                 f"{mtp_brief}"
                 f"{convextok_brief}"
                 f"{structure_brief}"
+                f"{graph_equiv_brief}"
                 f"{sidecar_brief}"
             )
             payload = {
@@ -3672,6 +4008,13 @@ def main() -> None:
                 "train/target_tokens": float(train_token_count.detach().float().item()),
                 "train/target_bytes": float(train_byte_count.detach().float().item()),
                 "train/step_avg_ms": float(approx_training_time_ms / max(step - args.start_step, 1)),
+                "graph_equiv/bpb": float(graph_equiv_bpb) if math.isfinite(graph_equiv_bpb) else float("nan"),
+                "graph_equiv/primary_bpb": float(graph_equiv_primary_bpb)
+                if math.isfinite(graph_equiv_primary_bpb)
+                else float("nan"),
+                "graph_equiv/sources": float(len(graph_equiv_bpb_terms)),
+                "graph_equiv/graph_in_graph_out": 1.0,
+                "graph_equiv/sequence_flattening_for_bpb": float(base_model.graph_output_flattening is not None),
                 "fineweb_graphify/enabled": float(args.fineweb_graphify),
                 "fineweb_graphify/tokengt_first_class": float(args.tokengt_first_class),
                 "fineweb_graphify/graph_radius": float(args.tokengt_graph_radius),
@@ -3705,7 +4048,7 @@ def main() -> None:
                 "graph_output_flattening/score_correction": float(args.graph_output_score_correction),
                 "graph_output_flattening/score_correction_weight": float(args.graph_output_score_correction_weight),
                 "graph_output_flattening/lr": float(args.graph_output_flattening_lr),
-                "graph_output_flattening/oai_fineweb_bpb_only": 1.0,
+                "graph_output_flattening/oai_fineweb_bpb_only": float(base_model.graph_output_flattening is not None),
                 "graph_output_flattening/calibration_enabled": float(
                     args.graph_output_calibration_loss_weight > 0.0
                     and base_model.graph_output_flattening is not None
@@ -3720,6 +4063,23 @@ def main() -> None:
                 "graph_lm_primary/late_start_step_config": float(args.late_graph_start_step),
                 "graph_lm_primary/late_mix_ratio_config": float(args.late_graph_mix_ratio),
                 "graph_lm_primary/late_upsample_passes_config": float(args.late_graph_upsample_passes),
+                "long_entry_full_row/enabled_config": float(long_entry_loader is not None),
+                "long_entry_full_row/every_config": float(args.long_entry_every),
+                "long_entry_full_row/batch_size_config": float(args.long_entry_batch_size),
+                "long_entry_full_row/max_tokens_config": float(args.long_entry_max_tokens),
+                "long_entry_full_row/segment_len_config": float(args.long_entry_segment_len),
+                "long_entry_full_row/segment_stride_config": float(args.long_entry_segment_stride),
+                "long_entry_full_row/max_segments_config": float(args.long_entry_max_segments),
+                "long_entry_full_row/loss_weight_config": float(args.long_entry_loss_weight),
+                "long_entry_full_row/next_segment_weight_config": float(args.long_entry_next_segment_weight),
+                "long_entry_full_row/boundary_weight_config": float(args.long_entry_boundary_weight),
+                "long_entry_full_row/coverage_weight_config": float(args.long_entry_segment_coverage_weight),
+                "long_entry_full_row/full_context_every_config": float(args.long_entry_full_context_every),
+                "long_entry_full_row/full_context_seq_len_config": float(args.long_entry_full_context_seq_len),
+                "long_entry_full_row/full_context_min_tokens_config": float(args.long_entry_full_context_min_tokens),
+                "long_entry_full_row/full_context_loss_weight_config": float(args.long_entry_full_context_loss_weight),
+                "long_entry_full_row/segment_checkpoint_config": float(args.long_entry_segment_checkpoint),
+                "long_entry_full_row/full_context_checkpoint_config": float(args.long_entry_full_context_checkpoint),
                 "toricblm_structure/flow_enabled_config": float(args.toricblm_structure_flow),
                 "toricblm_structure/head_enabled_config": float(structure_head is not None),
                 "toricblm_structure/train_glob_configured": float(bool(args.toricblm_structure_train_glob)),
@@ -3775,6 +4135,7 @@ def main() -> None:
                 "fineweb_caseops/enabled": float(args.fineweb_caseops),
                 "fineweb_caseops/swapped_token_ids": float(caseops_pairs),
                 "aux_grad_routing/enabled": float(args.aux_grad_routing),
+                "aux_grad_routing/long_entry_config": float(args.aux_grad_route_long_entry),
                 "score_first_tta/enabled": float(args.score_first_tta),
                 "score_first_tta/steps": float(args.score_first_tta_steps),
                 "score_first_tta/lr": float(args.score_first_tta_lr),
@@ -3836,6 +4197,7 @@ def main() -> None:
             payload.update(convextok_metrics)
             payload.update(flattening_calibration_metrics)
             payload.update(graph_lm_metrics)
+            payload.update(long_entry_metrics)
             payload.update(teacher_metrics)
             payload.update(oai_gflownet_metrics)
             payload.update(oai_fot_metrics)
